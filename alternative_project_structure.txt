@@ -1,0 +1,24 @@
+crypto-signal-pro/
+├── src/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── api/                # Rotas da API
+│   │   ├── core/               # Núcleo do sistema
+│   │   ├── services/           # Lógica de negócios
+│   │   ├── models/             # Modelos de dados
+│   │   ├── utils/              # Utilitários
+│   │   └── config.py           # Configurações
+│   ├── scripts/                # Scripts auxiliares
+│   └── main.py                 # Ponto de entrada
+├── tests/
+├── infra/                      # Configuração de infra
+├── docs/                       # Documentação
+├── requirements/
+│   ├── base.txt                # Dependências básicas
+│   ├── dev.txt                 # Dev dependencies
+│   └── prod.txt                # Production dependencies
+├── .env.example
+├── .gitignore
+├── Dockerfile
+├── docker-compose.yml
+└── README.md
