@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["gunicorn", "main:app", "-b", "0.0.0.0:$PORT"]
+CMD gunicorn main:app -b 0.0.0.0:${PORT}
