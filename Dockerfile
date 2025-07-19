@@ -2,16 +2,19 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Instala dependências básicas
-RUN apt-get update && apt-get install -y \
-    gcc python3-dev libpq-dev && \
-    rm -rf /var/lib/apt/lists/*
+# Instala TA-Lib e dependências
+RUN apt-get update && \
+    apt-get install -y build-essential && \
+    wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
+    tar -xzf ta-lib-0.4.0-src.tar.gz && \
+    cd ta-lib/ && \
+    ./configure --prefix=/usr && \
+    make && \
+    make install
 
-# Copia e instala requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/ .
+COPY . .
 
-EXPOSE 8000
-CMD ["gunicorn", "app.main:app", "--workers", "4", "--bind", "0.0.0.0:8000"]
+CMD ["gunicorn", "app:app", "-b", "0.0.0.0:${PORT:-8000}", "--access-logfile", "-"]
