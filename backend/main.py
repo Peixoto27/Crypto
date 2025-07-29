@@ -10,14 +10,12 @@ import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
 
-# --- INICIALIZAÇÃO DAS EXTENSÕES (SEM A APLICAÇÃO AINDA) ---
-# Criamos as instâncias das extensões aqui, mas não as ligamos a nenhuma app.
+# --- INICIALIZAÇÃO DAS EXTENSÕES ---
 db = SQLAlchemy()
 cache = Cache()
 cors = CORS()
 
 # --- MODELO DA BASE DE DADOS ---
-# Isto pode ser definido globalmente porque depende apenas do 'db'
 class SinalHistorico(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     pair = db.Column(db.String(20), nullable=False)
@@ -40,14 +38,20 @@ def create_app():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     # --- CONFIGURAÇÃO DA APP ---
-    # Configuração da Cache
     cache_config = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 21600}
     app.config.from_mapping(cache_config)
 
-    # Configuração da Base de Dados
+    # --- ✅ CORREÇÃO APLICADA AQUI ---
+    # Verifica se a variável de ambiente DATABASE_URL existe ANTES de tentar usá-la.
     db_url = os.environ.get('DATABASE_URL')
-    if db_url and db_url.startswith("postgres://"):
+    if not db_url:
+        # Se a variável não existir, lança um erro claro e impede a app de iniciar.
+        raise RuntimeError("ERRO CRÍTICO: A variável de ambiente DATABASE_URL não foi encontrada.")
+    
+    # Converte 'postgres://' para 'postgresql://' se necessário
+    if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
+    
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -57,9 +61,8 @@ def create_app():
     cors.init_app(app)
 
     # --- REGISTO DAS ROTAS (BLUEPRINTS) ---
-    # Movemos as nossas rotas para dentro da factory
     with app.app_context():
-        # (As funções de rota e lógica de sinais vêm aqui para dentro)
+        # (O resto do código das rotas e lógica de sinais permanece o mesmo)
         COINGECKO_MAP = {
             "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
             "SOLUSDT": "solana", "ADAUSDT": "cardano"
@@ -67,7 +70,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v3.1 (Factory Pattern)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v3.2 (Robust)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -99,13 +102,9 @@ def create_app():
         def salvar_sinal_no_historico(sinal_data):
             try:
                 pair_name = sinal_data.get("pair")
-                if not pair_name or sinal_data.get("signal") == "ERROR":
-                    return
-
+                if not pair_name or sinal_data.get("signal") == "ERROR": return
                 sinais_existentes = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
-                if len(sinais_existentes) >= 10:
-                    db.session.delete(sinais_existentes[0])
-
+                if len(sinais_existentes) >= 10: db.session.delete(sinais_existentes[0])
                 novo_sinal = SinalHistorico(
                     pair=sinal_data['pair'], entry=sinal_data['entry'], signal=sinal_data['signal'],
                     stop=sinal_data['stop'], target=sinal_data['target'], rsi=sinal_data['rsi']
@@ -124,34 +123,26 @@ def create_app():
                 response = requests.get(url, timeout=15 )
                 response.raise_for_status()
                 market_data = response.json()
-
                 df_prices = pd.DataFrame(market_data['prices'], columns=['timestamp', 'close'])
                 df_volumes = pd.DataFrame(market_data['total_volumes'], columns=['timestamp', 'volume'])
                 df_prices.set_index('timestamp', inplace=True)
                 df_volumes.set_index('timestamp', inplace=True)
                 df = df_prices.join(df_volumes, how='inner').reset_index()
-
                 if df.empty: raise Exception("DataFrame vazio.")
-
                 df.ta.rsi(length=14, append=True)
                 df.ta.sma(close='close', length=10, append=True)
                 df.ta.sma(close='close', length=30, append=True)
                 df['volume_sma_20'] = df['volume'].rolling(window=20).mean()
                 df.dropna(inplace=True)
-
                 if df.empty: raise Exception("Dados insuficientes para análise.")
-
                 last_row, prev_row = df.iloc[-1], df.iloc[-2]
                 signal_type, confidence = "HOLD", ""
                 volume_check = last_row['volume'] > (last_row['volume_sma_20'] * 1.20)
                 if volume_check: confidence = " (Volume Forte)"
-
                 rsi, sma_short, sma_long = last_row.get('RSI_14', 50), last_row['SMA_10'], last_row['SMA_30']
                 prev_sma_short, prev_sma_long = prev_row['SMA_10'], prev_row['SMA_30']
-
                 if sma_short > sma_long and prev_sma_short <= prev_sma_long and rsi < 70 and volume_check: signal_type = "BUY"
                 elif sma_short < sma_long and prev_sma_short >= prev_sma_long and rsi > 30 and volume_check: signal_type = "SELL"
-                
                 entry_price = float(last_row['close'])
                 return {
                     "pair": symbol.replace("USDT", "/USDT"), "entry": round(entry_price, 4),
@@ -173,5 +164,4 @@ if __name__ == "__main__":
         db.create_all()
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando servidor na porta {port}")
-    # Este comando não é usado pela Railway, mas é útil para testes locais
     app.run(debug=False, host='0.0.0.0', port=port)
