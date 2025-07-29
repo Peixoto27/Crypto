@@ -1,80 +1,81 @@
 import os
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
 import pandas as pd
 import pandas_ta as ta
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Inicializa a aplicação Flask
 app = Flask(__name__)
 CORS(app)
 
+# Mapeamento de símbolos da Binance para IDs da CoinGecko
+COINGECKO_MAP = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "XRPUSDT": "ripple",
+    "SOLUSDT": "solana",
+    "ADAUSDT": "cardano"
+}
+
 def get_technical_signal(symbol):
     """
-    Busca dados históricos, calcula médias móveis e RSI, 
-    e gera um sinal de COMPRA ou VENDA com base em ambos os indicadores.
+    Busca dados históricos da CoinGecko, calcula indicadores técnicos
+    e gera um sinal de COMPRA, VENDA ou HOLD.
     """
     try:
-        # 1. Buscar dados históricos (velas diárias), agora pegando 50 dias para dar mais dados ao RSI
-        # --- CORREÇÃO APLICADA AQUI ---
-        # Trocado 'api.binance.com' por 'api.binance.me' para evitar bloqueio geográfico (erro 451)
-        url = f'https://api.binance.me/api/v3/klines?symbol={symbol}&interval=1d&limit=50'
+        coingecko_id = COINGECKO_MAP.get(symbol)
+        if not coingecko_id:
+            raise Exception(f"Símbolo {symbol} não mapeado para a CoinGecko.")
+
+        # 1. Buscar dados históricos da CoinGecko (velas diárias para os últimos 90 dias)
+        # A CoinGecko não tem 'limit', então pedimos um intervalo de datas.
+        # Pedimos 90 dias para garantir dados suficientes para os cálculos.
+        url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/ohlc?vs_currency=usd&days=90'
         response = requests.get(url, timeout=10 )
         response.raise_for_status()
         data = response.json()
 
+        if not data:
+            raise Exception("API da CoinGecko não retornou dados.")
+
         # 2. Processar os dados com o Pandas
-        df = pd.DataFrame(data, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume', 
-            'close_time', 'quote_asset_volume', 'number_of_trades', 
-            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-        ])
-        df['close'] = pd.to_numeric(df['close'])
-        df['high'] = pd.to_numeric(df['high'])
-        df['low'] = pd.to_numeric(df['low'])
+        # O formato da CoinGecko é [timestamp, open, high, low, close]
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close'])
+        
+        # A CoinGecko já fornece os tipos numéricos corretos, então a conversão não é necessária.
+        # df['close'] = pd.to_numeric(df['close']) ...
 
         # 3. Calcular os Indicadores Técnicos
-        # Adicionamos o cálculo do RSI (Índice de Força Relativa)
-        df.ta.rsi(length=14, append=True)  # Calcula o RSI de 14 dias e adiciona ao DataFrame
-        df.ta.sma(length=10, append=True)  # Média Móvel Curta (SMA_10)
-        df.ta.sma(length=30, append=True)  # Média Móvel Longa (SMA_30)
+        df.ta.rsi(length=14, append=True)
+        df.ta.sma(length=10, append=True)
+        df.ta.sma(length=30, append=True)
 
-        # Remove linhas que não têm dados suficientes para os cálculos
         df.dropna(inplace=True)
         if df.empty:
             raise Exception("Não há dados suficientes para a análise após o cálculo dos indicadores.")
 
         # 4. Gerar o Sinal com a Lógica Combinada
-        # Pegamos os valores mais recentes dos indicadores
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2] if len(df) > 1 else last_row
 
-        signal_type = "HOLD"  # Sinal padrão
+        signal_type = "HOLD"
         rsi_value = last_row.get('RSI_14', 50)
 
-        # CONDIÇÃO DE COMPRA (MAIS RIGOROSA)
-        # A média curta cruzou para CIMA da longa E o RSI está abaixo de 70 (não sobrecomprado)
-        if last_row['SMA_10'] > last_row['SMA_30'] and prev_row['SMA_10'] <= prev_row['SMA_30']:
-            if rsi_value < 70:
-                signal_type = "BUY"
-            else:
-                signal_type = "HOLD"
+        # Lógica de cruzamento de médias
+        sma_short = last_row['SMA_10']
+        sma_long = last_row['SMA_30']
+        prev_sma_short = prev_row['SMA_10']
+        prev_sma_long = prev_row['SMA_30']
 
-        # CONDIÇÃO DE VENDA (MAIS RIGOROSA)
-        # A média curta cruzou para BAIXO da longa E o RSI está acima de 30 (não sobrevendido)
-        elif last_row['SMA_10'] < last_row['SMA_30'] and prev_row['SMA_10'] >= prev_row['SMA_30']:
-            if rsi_value > 30:
-                signal_type = "SELL"
-            else:
-                signal_type = "HOLD"
+        # Cruzamento de alta (compra)
+        if sma_short > sma_long and prev_sma_short <= prev_sma_long and rsi_value < 70:
+            signal_type = "BUY"
+        # Cruzamento de baixa (venda)
+        elif sma_short < sma_long and prev_sma_short >= prev_sma_long and rsi_value > 30:
+            signal_type = "SELL"
         
-        # Se não houve cruzamento, definimos o estado de HOLD
-        elif last_row['SMA_10'] > last_row['SMA_30']:
-            signal_type = "HOLD"
-        else:
-            signal_type = "HOLD"
-
         entry_price = float(last_row['close'])
         
         return {
@@ -92,10 +93,6 @@ def get_technical_signal(symbol):
         return {
             "pair": symbol.replace("USDT", "/USDT"), 
             "signal": "ERROR", 
-            "entry": 0, 
-            "stop": 0,
-            "target": 0,
-            "rsi": 0,
             "error_message": str(e),
             "timestamp": datetime.now().isoformat()
         }
@@ -105,6 +102,7 @@ def home():
     return jsonify({
         "message": "Crypton Signals API",
         "status": "online",
+        "data_source": "CoinGecko",
         "endpoints": ["/signals"],
         "timestamp": datetime.now().isoformat()
     })
@@ -112,7 +110,6 @@ def home():
 @app.route("/signals")
 def get_signals():
     try:
-        # Lista de símbolos para processar
         symbols_to_process = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT"]
         
         signals = []
