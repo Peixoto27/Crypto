@@ -74,4 +74,3 @@ Um painel de análise técnica em tempo real que busca sinais de trading (COMPRA
 ## 🤝 Contribuições
 
 Contribuições são bem-vindas! Se você tiver ideias para novas funcionalidades ou encontrar um bug, sinta-se à vontade para abrir uma *issue* ou enviar um *pull request*.
-
