@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel de Sinais de Cripto</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Ícones do Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+</head>
+<body>
+    <!-- Tela de Login -->
+    <div id="login-screen">
+        <div class="login-box">
+            <h2>Acesso ao Painel</h2>
+            <input type="password" id="password-input" placeholder="Digite a senha">
+            <button id="login-button">Entrar</button>
+        </div>
+    </div>
+
+    <!-- Aplicação Principal (escondida por padrão ) -->
+    <div id="app">
+        <header>
+            <h1>Painel de Sinais</h1>
+            <div class="controls">
+                <div id="last-updated-timestamp"></div>
+                <div class="timeframe-selector">
+                    <button data-timeframe="1m">1m</button>
+                    <button data-timeframe="5m">5m</button>
+                    <button data-timeframe="15m">15m</button>
+                    <button data-timeframe="1h">1h</button>
+                    <button data-timeframe="1d" class="active">1d</button>
+                </div>
+                <button id="alerts-btn" title="Gerenciar Alertas"><i class="fas fa-bell"></i></button>
+            </div>
+        </header>
+
+        <main>
+            <div id="signals-container" class="signals-grid">
+                <!-- Cards de sinais serão inseridos aqui -->
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal de Alertas -->
+    <div id="alerts-modal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Gerenciar Alertas</h2>
+            <div id="add-alert-form">
+                <input type="text" id="alert-pair" placeholder="Ex: BTC/USDT">
+                <select id="alert-condition">
+                    <option value="above">Acima de</option>
+                    <option value="below">Abaixo de</option>
+                </select>
+                <input type="number" id="alert-price" placeholder="Preço">
+                <button id="add-alert">Adicionar</button>
+            </div>
+            <div id="alerts-list"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
