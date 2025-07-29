@@ -1,5 +1,6 @@
 import os
 import logging
+import time # <-- 1. IMPORTADO O MÓDULO TIME
 from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
@@ -9,16 +10,10 @@ from datetime import datetime
 
 # --- CONFIGURAÇÃO INICIAL ---
 
-# Inicializa a aplicação Flask
 app = Flask(__name__)
 CORS(app)
-
-# Configura o logging para fornecer informações mais detalhadas nos logs da Railway
-# Isto ajuda a depurar problemas sem "crashar" a aplicação
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Mapeamento de símbolos da Binance para IDs da CoinGecko
-# Este dicionário traduz os símbolos que o seu frontend usa para os que a API da CoinGecko espera
 COINGECKO_MAP = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
@@ -26,7 +21,6 @@ COINGECKO_MAP = {
     "SOLUSDT": "solana",
     "ADAUSDT": "cardano"
 }
-
 
 # --- LÓGICA PRINCIPAL ---
 
@@ -40,22 +34,18 @@ def get_technical_signal(symbol):
         if not coingecko_id:
             raise Exception(f"Símbolo {symbol} não mapeado para a CoinGecko.")
 
-        # 1. Buscar dados históricos da CoinGecko
         url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/ohlc?vs_currency=usd&days=90'
         logging.info(f"Buscando dados para {symbol} de {url}" )
         
-        response = requests.get(url, timeout=15) # Aumentado o timeout para 15s por segurança
-        response.raise_for_status()  # Lança um erro para respostas HTTP ruins (4xx ou 5xx)
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
         
         data = response.json()
-
         if not data:
             raise Exception("API da CoinGecko não retornou dados.")
 
-        # 2. Processar os dados com o Pandas
         df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close'])
         
-        # 3. Calcular os Indicadores Técnicos
         df.ta.rsi(length=14, append=True)
         df.ta.sma(length=10, append=True)
         df.ta.sma(length=30, append=True)
@@ -64,7 +54,6 @@ def get_technical_signal(symbol):
         if df.empty:
             raise Exception("Não há dados suficientes para a análise após o cálculo dos indicadores.")
 
-        # 4. Gerar o Sinal com a Lógica Combinada
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2] if len(df) > 1 else last_row
 
@@ -75,10 +64,8 @@ def get_technical_signal(symbol):
         prev_sma_short = prev_row['SMA_10']
         prev_sma_long = prev_row['SMA_30']
 
-        # Cruzamento de alta (compra)
         if sma_short > sma_long and prev_sma_short <= prev_sma_long and rsi_value < 70:
             signal_type = "BUY"
-        # Cruzamento de baixa (venda)
         elif sma_short < sma_long and prev_sma_short >= prev_sma_long and rsi_value > 30:
             signal_type = "SELL"
         
@@ -95,7 +82,7 @@ def get_technical_signal(symbol):
         }
 
     except requests.exceptions.HTTPError as http_err:
-        logging.error(f"Erro HTTP ao buscar dados para {symbol}: {http_err} - URL: {http_err.request.url} - Resposta: {http_err.response.text[:100]}" )
+        logging.error(f"Erro HTTP ao buscar dados para {symbol}: {http_err} - URL: {http_err.request.url}" )
         return {
             "pair": symbol.replace("USDT", "/USDT"), 
             "signal": "ERROR", 
@@ -111,12 +98,10 @@ def get_technical_signal(symbol):
             "timestamp": datetime.now().isoformat()
         }
 
-
 # --- ENDPOINTS DA API (ROTAS) ---
 
 @app.route("/")
 def home():
-    """Endpoint inicial que descreve a API."""
     return jsonify({
         "message": "Crypton Signals API",
         "status": "online",
@@ -127,7 +112,6 @@ def home():
 
 @app.route("/signals")
 def get_signals():
-    """Endpoint principal que retorna os sinais técnicos para uma lista de moedas."""
     try:
         symbols_to_process = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT"]
         
@@ -135,6 +119,9 @@ def get_signals():
         for symbol in symbols_to_process:
             signal = get_technical_signal(symbol)
             signals.append(signal)
+            # --- 2. ADICIONADA PAUSA AQUI ---
+            # Pausa de 1.5 segundos para evitar o erro 429 (Too Many Requests)
+            time.sleep(1.5) 
         
         logging.info(f"Sinais técnicos gerados com sucesso: {len(signals)} sinais processados.")
         
@@ -155,18 +142,16 @@ def get_signals():
 
 @app.route("/health")
 def health_check():
-    """Endpoint de verificação de saúde, útil para serviços de monitoramento."""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat()
     })
 
-
 # --- EXECUÇÃO DA APLICAÇÃO ---
 
 if __name__ == "__main__":
-    # Obtém a porta do ambiente (fornecida pela Railway) ou usa 5000 como padrão
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando servidor na porta {port}")
-    # O debug=False é importante para produção
-    app.run(debug=False, host='0.0.0.0', port=port)
+    app.run(debug=False, host='0.0.0.0', port=port)```
+
+Faça o deploy com este código. Agora, a sua aplicação deve funcionar de forma estável, sem os erros 429, e consequentemente, sem os erros de `KeyError`.
