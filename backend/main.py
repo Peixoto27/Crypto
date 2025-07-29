@@ -20,9 +20,7 @@ app.config.from_mapping(config)
 cache = Cache(app)
 
 # --- CONFIGURAÇÃO DA BASE DE DADOS ---
-# Pega o URL da base de dados da variável de ambiente que configurámos na Railway
 db_url = os.environ.get('DATABASE_URL')
-# A Railway usa 'postgres://' mas SQLAlchemy espera 'postgresql://'
 if db_url and db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
@@ -39,24 +37,23 @@ class SinalHistorico(db.Model):
     stop = db.Column(db.Float, nullable=False)
     target = db.Column(db.Float, nullable=False)
     rsi = db.Column(db.Float, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    # --- ✅ CORREÇÃO APLICADA AQUI ---
+    timestamp = db.Column(db.DateTime, default=db.func.current_timestamp())
 
     def to_dict(self):
-        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+        # Converte o objeto para um dicionário, formatando a data
+        data = {c.name: getattr(self, c.name) for c in self.__table__.columns}
+        if 'timestamp' in data and isinstance(data['timestamp'], datetime):
+            data['timestamp'] = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+        return data
 
-# --- LÓGICA DE SINAIS (COM INTEGRAÇÃO DA BASE DE DADOS) ---
+# (O resto do código permanece exatamente o mesmo)
+
 COINGECKO_MAP = {
     "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
     "SOLUSDT": "solana", "ADAUSDT": "cardano"
 }
 
-def get_technical_signal(symbol):
-    # (A lógica para buscar dados e calcular o sinal permanece a mesma)
-    # ... (código omitido por brevidade, mas está no bloco completo abaixo)
-    # A única diferença é que no final, chamamos a função para salvar o sinal
-    pass # Esta função será substituída pelo código completo abaixo
-
-# --- FUNÇÃO PARA SALVAR NO HISTÓRICO (COM LÓGICA DE LIMPEZA) ---
 def salvar_sinal_no_historico(sinal_data):
     with app.app_context():
         try:
@@ -65,14 +62,12 @@ def salvar_sinal_no_historico(sinal_data):
                 logging.info(f"Sinal para {pair_name} é um erro ou inválido, não será salvo.")
                 return
 
-            # Lógica de limpeza: manter apenas os últimos 10 por moeda
             sinais_existentes = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
             if len(sinais_existentes) >= 10:
                 sinal_mais_antigo = sinais_existentes[0]
                 logging.info(f"Limite de histórico atingido para {pair_name}. Removendo sinal de {sinal_mais_antigo.timestamp}.")
                 db.session.delete(sinal_mais_antigo)
 
-            # Cria e salva o novo registro
             novo_sinal = SinalHistorico(
                 pair=sinal_data['pair'],
                 entry=sinal_data['entry'],
@@ -89,8 +84,6 @@ def salvar_sinal_no_historico(sinal_data):
             logging.error(f"Falha ao salvar sinal no histórico para {pair_name}: {e}")
             db.session.rollback()
 
-# --- ENDPOINTS DA API (ROTAS) ---
-
 @app.route("/")
 def home():
     return jsonify({"message": "Crypton Signals API v3 (with Database History)", "status": "online"})
@@ -101,10 +94,9 @@ def get_signals():
     logging.info("CACHE MISS: Gerando novos sinais e salvando no histórico.")
     signals = []
     for symbol in COINGECKO_MAP.keys():
-        signal = get_technical_signal(symbol) # Esta função agora precisa ser completa
+        signal = get_technical_signal(symbol)
         signals.append(signal)
         
-        # Salva o sinal no histórico DEPOIS de gerá-lo
         if signal.get("signal") != "ERROR":
             salvar_sinal_no_historico(signal)
             
@@ -117,7 +109,6 @@ def get_history():
     try:
         sinais = SinalHistorico.query.order_by(SinalHistorico.timestamp.desc()).all()
         
-        # Agrupa os sinais por par de moeda
         history_by_pair = {}
         for sinal in sinais:
             if sinal.pair not in history_by_pair:
@@ -129,7 +120,6 @@ def get_history():
         logging.error(f"Erro ao buscar histórico da base de dados: {e}")
         return jsonify({"error": "Não foi possível buscar o histórico."}), 500
 
-# --- CÓDIGO COMPLETO DA FUNÇÃO get_technical_signal ---
 def get_technical_signal(symbol):
     try:
         coingecko_id = COINGECKO_MAP.get(symbol)
@@ -200,10 +190,8 @@ def get_technical_signal(symbol):
         logging.error(f"Erro ao gerar sinal para {symbol}: {e}")
         return {"pair": symbol.replace("USDT", "/USDT"), "signal": "ERROR", "error_message": str(e), "timestamp": datetime.now().isoformat()}
 
-# --- INICIALIZAÇÃO DA APLICAÇÃO E DA BASE DE DADOS ---
 if __name__ == "__main__":
     with app.app_context():
-        # Cria a tabela na base de dados se ela ainda não existir
         db.create_all()
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando servidor na porta {port}")
