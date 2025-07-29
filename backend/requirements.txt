@@ -1,6 +1,7 @@
-Flask
-Flask-Cors
-Flask-Caching
-requests
-pandas
-pandas-ta
+Flask==3.0.3
+Flask-Cors==4.0.1
+Flask-Caching==2.3.0
+requests==2.32.3
+pandas==2.2.2
+numpy==1.26.4
+pandas-ta==0.3.14b
