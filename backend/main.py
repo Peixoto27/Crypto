@@ -10,14 +10,10 @@ from datetime import datetime
 
 # --- CONFIGURAÇÃO INICIAL ---
 
-# Inicializa a aplicação Flask
 app = Flask(__name__)
 CORS(app)
-
-# Configura o logging para fornecer informações mais detalhadas nos logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Mapeamento de símbolos para IDs da CoinGecko
 COINGECKO_MAP = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
@@ -25,7 +21,6 @@ COINGECKO_MAP = {
     "SOLUSDT": "solana",
     "ADAUSDT": "cardano"
 }
-
 
 # --- LÓGICA PRINCIPAL ---
 
@@ -51,11 +46,17 @@ def get_technical_signal(symbol):
 
         df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close'])
         
+        # Calcula os indicadores
         df.ta.rsi(length=14, append=True)
         df.ta.sma(length=10, append=True)
         df.ta.sma(length=30, append=True)
 
+        # Remove linhas que não têm dados suficientes para os cálculos (ex: os primeiros 29 dias para a SMA_30)
         df.dropna(inplace=True)
+        
+        # --- ✅ SOLUÇÃO APLICADA AQUI ---
+        # Verifica se o DataFrame ficou vazio APÓS remover as linhas com dados insuficientes.
+        # Se estiver vazio, significa que não há dados suficientes para a análise.
         if df.empty:
             raise Exception("Não há dados suficientes para a análise após o cálculo dos indicadores.")
 
@@ -103,7 +104,6 @@ def get_technical_signal(symbol):
             "timestamp": datetime.now().isoformat()
         }
 
-
 # --- ENDPOINTS DA API (ROTAS) ---
 
 @app.route("/")
@@ -125,7 +125,6 @@ def get_signals():
         for symbol in symbols_to_process:
             signal = get_technical_signal(symbol)
             signals.append(signal)
-            # Pausa de 1.5 segundos para evitar o erro 429 (Too Many Requests) da API da CoinGecko
             time.sleep(1.5) 
         
         logging.info(f"Sinais técnicos gerados com sucesso: {len(signals)} sinais processados.")
@@ -152,11 +151,9 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     })
 
-
 # --- EXECUÇÃO DA APLICAÇÃO ---
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando servidor na porta {port}")
     app.run(debug=False, host='0.0.0.0', port=port)
-
