@@ -1,16 +1,24 @@
 import os
+import logging
 from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
 import pandas as pd
 import pandas_ta as ta
-from datetime import datetime, timedelta
+from datetime import datetime
+
+# --- CONFIGURAÇÃO INICIAL ---
 
 # Inicializa a aplicação Flask
 app = Flask(__name__)
 CORS(app)
 
+# Configura o logging para fornecer informações mais detalhadas nos logs da Railway
+# Isto ajuda a depurar problemas sem "crashar" a aplicação
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # Mapeamento de símbolos da Binance para IDs da CoinGecko
+# Este dicionário traduz os símbolos que o seu frontend usa para os que a API da CoinGecko espera
 COINGECKO_MAP = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
@@ -18,6 +26,9 @@ COINGECKO_MAP = {
     "SOLUSDT": "solana",
     "ADAUSDT": "cardano"
 }
+
+
+# --- LÓGICA PRINCIPAL ---
 
 def get_technical_signal(symbol):
     """
@@ -29,24 +40,21 @@ def get_technical_signal(symbol):
         if not coingecko_id:
             raise Exception(f"Símbolo {symbol} não mapeado para a CoinGecko.")
 
-        # 1. Buscar dados históricos da CoinGecko (velas diárias para os últimos 90 dias)
-        # A CoinGecko não tem 'limit', então pedimos um intervalo de datas.
-        # Pedimos 90 dias para garantir dados suficientes para os cálculos.
+        # 1. Buscar dados históricos da CoinGecko
         url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/ohlc?vs_currency=usd&days=90'
-        response = requests.get(url, timeout=10 )
-        response.raise_for_status()
+        logging.info(f"Buscando dados para {symbol} de {url}" )
+        
+        response = requests.get(url, timeout=15) # Aumentado o timeout para 15s por segurança
+        response.raise_for_status()  # Lança um erro para respostas HTTP ruins (4xx ou 5xx)
+        
         data = response.json()
 
         if not data:
             raise Exception("API da CoinGecko não retornou dados.")
 
         # 2. Processar os dados com o Pandas
-        # O formato da CoinGecko é [timestamp, open, high, low, close]
         df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close'])
         
-        # A CoinGecko já fornece os tipos numéricos corretos, então a conversão não é necessária.
-        # df['close'] = pd.to_numeric(df['close']) ...
-
         # 3. Calcular os Indicadores Técnicos
         df.ta.rsi(length=14, append=True)
         df.ta.sma(length=10, append=True)
@@ -62,8 +70,6 @@ def get_technical_signal(symbol):
 
         signal_type = "HOLD"
         rsi_value = last_row.get('RSI_14', 50)
-
-        # Lógica de cruzamento de médias
         sma_short = last_row['SMA_10']
         sma_long = last_row['SMA_30']
         prev_sma_short = prev_row['SMA_10']
@@ -88,8 +94,16 @@ def get_technical_signal(symbol):
             "timestamp": datetime.now().isoformat()
         }
 
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"Erro HTTP ao buscar dados para {symbol}: {http_err} - URL: {http_err.request.url} - Resposta: {http_err.response.text[:100]}" )
+        return {
+            "pair": symbol.replace("USDT", "/USDT"), 
+            "signal": "ERROR", 
+            "error_message": f"Falha na API ({http_err.response.status_code} )",
+            "timestamp": datetime.now().isoformat()
+        }
     except Exception as e:
-        print(f"Erro ao gerar sinal técnico para {symbol}: {e}")
+        logging.error(f"Erro inesperado ao gerar sinal para {symbol}: {e}")
         return {
             "pair": symbol.replace("USDT", "/USDT"), 
             "signal": "ERROR", 
@@ -97,18 +111,23 @@ def get_technical_signal(symbol):
             "timestamp": datetime.now().isoformat()
         }
 
+
+# --- ENDPOINTS DA API (ROTAS) ---
+
 @app.route("/")
 def home():
+    """Endpoint inicial que descreve a API."""
     return jsonify({
         "message": "Crypton Signals API",
         "status": "online",
         "data_source": "CoinGecko",
-        "endpoints": ["/signals"],
+        "endpoints": ["/signals", "/health"],
         "timestamp": datetime.now().isoformat()
     })
 
 @app.route("/signals")
 def get_signals():
+    """Endpoint principal que retorna os sinais técnicos para uma lista de moedas."""
     try:
         symbols_to_process = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT"]
         
@@ -117,7 +136,7 @@ def get_signals():
             signal = get_technical_signal(symbol)
             signals.append(signal)
         
-        print(f"Sinais técnicos gerados com sucesso: {len(signals)} sinais")
+        logging.info(f"Sinais técnicos gerados com sucesso: {len(signals)} sinais processados.")
         
         return jsonify({
             "signals": signals,
@@ -127,21 +146,27 @@ def get_signals():
         })
         
     except Exception as e:
-        print(f"Erro geral ao gerar os sinais: {e}")
+        logging.error(f"Erro GERAL e inesperado na rota /signals: {e}")
         return jsonify({
-            "error": f"Falha ao gerar sinais: {str(e)}",
+            "error": f"Falha crítica ao gerar sinais: {str(e)}",
             "timestamp": datetime.now().isoformat(),
             "status": "error"
         }), 500
 
 @app.route("/health")
 def health_check():
+    """Endpoint de verificação de saúde, útil para serviços de monitoramento."""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat()
     })
 
+
+# --- EXECUÇÃO DA APLICAÇÃO ---
+
 if __name__ == "__main__":
+    # Obtém a porta do ambiente (fornecida pela Railway) ou usa 5000 como padrão
     port = int(os.environ.get("PORT", 5000))
-    print(f"Iniciando servidor na porta {port}")
+    logging.info(f"Iniciando servidor na porta {port}")
+    # O debug=False é importante para produção
     app.run(debug=False, host='0.0.0.0', port=port)
