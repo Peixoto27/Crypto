@@ -1,1 +1,109 @@
+.app-container {
+  padding: 20px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
 
+.app-header {
+  text-align: center;
+  margin-bottom: 40px;
+  color: #e0e0e0;
+}
+
+.app-header h1 {
+  font-size: 2.5rem;
+  margin-bottom: 10px;
+}
+
+.app-header p {
+  font-size: 1.1rem;
+  color: #b0b0b0;
+}
+
+.status-container {
+  text-align: center;
+  padding: 50px;
+  color: #e0e0e0;
+}
+
+.error-message {
+  color: #ff6b6b;
+  background-color: #2e1a1a;
+  padding: 10px;
+  border-radius: 5px;
+}
+
+.signals-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 20px;
+}
+
+.signal-card {
+  background-color: #1e1e1e;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 20px;
+  transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+}
+
+.signal-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+}
+
+.pair-name {
+  margin-top: 0;
+  margin-bottom: 15px;
+  text-align: center;
+  color: #ffffff;
+  font-size: 1.5rem;
+}
+
+.signal-display {
+  text-align: center;
+  font-size: 1.2rem;
+  font-weight: bold;
+  padding: 10px;
+  border-radius: 5px;
+  margin-bottom: 15px;
+  color: #fff;
+}
+
+/* Cores para os sinais */
+.signal-display.buy {
+  background-color: #28a745; /* Verde */
+}
+
+.signal-display.sell {
+  background-color: #dc3545; /* Vermelho */
+}
+
+.signal-display.hold {
+  background-color: #6c757d; /* Cinza */
+}
+
+.signal-display.error {
+  background-color: #ffc107; /* Amarelo */
+  color: #1e1e1e;
+}
+
+.signal-details {
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+.signal-details p {
+  margin: 5px 0;
+  display: flex;
+  justify-content: space-between;
+}
+
+.signal-details strong {
+  color: #a0a0a0;
+}
+
+.error-details {
+  font-size: 0.9rem;
+  font-style: italic;
+}
