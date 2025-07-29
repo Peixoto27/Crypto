@@ -1,6 +1,6 @@
 import os
 import logging
-import time # <-- 1. IMPORTADO O MÓDULO TIME
+import time
 from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
@@ -10,10 +10,14 @@ from datetime import datetime
 
 # --- CONFIGURAÇÃO INICIAL ---
 
+# Inicializa a aplicação Flask
 app = Flask(__name__)
 CORS(app)
+
+# Configura o logging para fornecer informações mais detalhadas nos logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Mapeamento de símbolos para IDs da CoinGecko
 COINGECKO_MAP = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
@@ -21,6 +25,7 @@ COINGECKO_MAP = {
     "SOLUSDT": "solana",
     "ADAUSDT": "cardano"
 }
+
 
 # --- LÓGICA PRINCIPAL ---
 
@@ -98,6 +103,7 @@ def get_technical_signal(symbol):
             "timestamp": datetime.now().isoformat()
         }
 
+
 # --- ENDPOINTS DA API (ROTAS) ---
 
 @app.route("/")
@@ -119,8 +125,7 @@ def get_signals():
         for symbol in symbols_to_process:
             signal = get_technical_signal(symbol)
             signals.append(signal)
-            # --- 2. ADICIONADA PAUSA AQUI ---
-            # Pausa de 1.5 segundos para evitar o erro 429 (Too Many Requests)
+            # Pausa de 1.5 segundos para evitar o erro 429 (Too Many Requests) da API da CoinGecko
             time.sleep(1.5) 
         
         logging.info(f"Sinais técnicos gerados com sucesso: {len(signals)} sinais processados.")
@@ -147,11 +152,11 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     })
 
+
 # --- EXECUÇÃO DA APLICAÇÃO ---
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando servidor na porta {port}")
-    app.run(debug=False, host='0.0.0.0', port=port)```
+    app.run(debug=False, host='0.0.0.0', port=port)
 
-Faça o deploy com este código. Agora, a sua aplicação deve funcionar de forma estável, sem os erros 429, e consequentemente, sem os erros de `KeyError`.
