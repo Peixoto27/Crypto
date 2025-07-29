@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import './App.css'; // Importa os nossos estilos
+import './App.css'; // Importa os estilos do App.css
+import './index.css'; // Importa os estilos globais do index.css
 
 function App() {
   // Estado para guardar a lista de sinais recebida da API
