@@ -17,8 +17,10 @@ def get_technical_signal(symbol):
     """
     try:
         # 1. Buscar dados históricos (velas diárias), agora pegando 50 dias para dar mais dados ao RSI
-        url = f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit=50'
-        response = requests.get(url, timeout=10)
+        # --- CORREÇÃO APLICADA AQUI ---
+        # Trocado 'api.binance.com' por 'api.binance.me' para evitar bloqueio geográfico (erro 451)
+        url = f'https://api.binance.me/api/v3/klines?symbol={symbol}&interval=1d&limit=50'
+        response = requests.get(url, timeout=10 )
         response.raise_for_status()
         data = response.json()
 
@@ -146,4 +148,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Iniciando servidor na porta {port}")
     app.run(debug=False, host='0.0.0.0', port=port)
-
