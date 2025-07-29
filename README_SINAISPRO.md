@@ -120,3 +120,4 @@ Projeto privado. Para fins de uso comercial ou parceria, entre em contato.
 Desenvolvido por [Seu Nome ou Empresa]  
 📧 Email: contato@seudominio.com  
 📱 Instagram: [@seuperfil]
+
