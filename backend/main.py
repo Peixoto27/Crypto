@@ -3,6 +3,7 @@ import logging
 import time
 from flask import Flask, jsonify
 from flask_cors import CORS
+from flask_caching import Cache # <-- 1. IMPORTADO O CACHING
 import requests
 import pandas as pd
 import pandas_ta as ta
@@ -12,6 +13,19 @@ from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
+
+# --- 2. CONFIGURAÇÃO DA CACHE ---
+# Configura uma cache simples, baseada em memória.
+# TIMEOUT é definido em segundos. 21600 segundos = 6 horas.
+# Pode alterar para 86400 para 24 horas.
+config = {
+    "DEBUG": True,
+    "CACHE_TYPE": "SimpleCache",
+    "CACHE_DEFAULT_TIMEOUT": 21600 
+}
+app.config.from_mapping(config)
+cache = Cache(app) # Inicializa a cache com a aplicação
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 COINGECKO_MAP = {
@@ -23,12 +37,8 @@ COINGECKO_MAP = {
 }
 
 # --- LÓGICA PRINCIPAL ---
-
+# A função get_technical_signal permanece a mesma
 def get_technical_signal(symbol):
-    """
-    Busca dados históricos da CoinGecko, calcula indicadores técnicos
-    e gera um sinal de COMPRA, VENDA ou HOLD.
-    """
     try:
         coingecko_id = COINGECKO_MAP.get(symbol)
         if not coingecko_id:
@@ -46,17 +56,11 @@ def get_technical_signal(symbol):
 
         df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close'])
         
-        # Calcula os indicadores
         df.ta.rsi(length=14, append=True)
         df.ta.sma(length=10, append=True)
         df.ta.sma(length=30, append=True)
 
-        # Remove linhas que não têm dados suficientes para os cálculos (ex: os primeiros 29 dias para a SMA_30)
         df.dropna(inplace=True)
-        
-        # --- ✅ SOLUÇÃO APLICADA AQUI ---
-        # Verifica se o DataFrame ficou vazio APÓS remover as linhas com dados insuficientes.
-        # Se estiver vazio, significa que não há dados suficientes para a análise.
         if df.empty:
             raise Exception("Não há dados suficientes para a análise após o cálculo dos indicadores.")
 
@@ -89,35 +93,25 @@ def get_technical_signal(symbol):
 
     except requests.exceptions.HTTPError as http_err:
         logging.error(f"Erro HTTP ao buscar dados para {symbol}: {http_err} - URL: {http_err.request.url}" )
-        return {
-            "pair": symbol.replace("USDT", "/USDT"), 
-            "signal": "ERROR", 
-            "error_message": f"Falha na API ({http_err.response.status_code} )",
-            "timestamp": datetime.now().isoformat()
-        }
+        return {"pair": symbol.replace("USDT", "/USDT"), "signal": "ERROR", "error_message": f"Falha na API ({http_err.response.status_code} )", "timestamp": datetime.now().isoformat()}
     except Exception as e:
         logging.error(f"Erro inesperado ao gerar sinal para {symbol}: {e}")
-        return {
-            "pair": symbol.replace("USDT", "/USDT"), 
-            "signal": "ERROR", 
-            "error_message": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
+        return {"pair": symbol.replace("USDT", "/USDT"), "signal": "ERROR", "error_message": str(e), "timestamp": datetime.now().isoformat()}
 
 # --- ENDPOINTS DA API (ROTAS) ---
 
 @app.route("/")
 def home():
-    return jsonify({
-        "message": "Crypton Signals API",
-        "status": "online",
-        "data_source": "CoinGecko",
-        "endpoints": ["/signals", "/health"],
-        "timestamp": datetime.now().isoformat()
-    })
+    return jsonify({"message": "Crypton Signals API", "status": "online", "data_source": "CoinGecko", "caching_enabled": True, "cache_timeout_seconds": 21600})
 
 @app.route("/signals")
+@cache.cached() # <-- 3. A MÁGICA ACONTECE AQUI!
 def get_signals():
+    """
+    Endpoint principal que retorna os sinais técnicos.
+    O resultado desta função será guardado em cache pelo tempo definido.
+    """
+    logging.info("CACHE MISS: Gerando novos sinais a partir da API.")
     try:
         symbols_to_process = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT"]
         
@@ -125,31 +119,20 @@ def get_signals():
         for symbol in symbols_to_process:
             signal = get_technical_signal(symbol)
             signals.append(signal)
+            # A pausa ainda é importante para a primeira chamada do dia
             time.sleep(1.5) 
         
         logging.info(f"Sinais técnicos gerados com sucesso: {len(signals)} sinais processados.")
         
-        return jsonify({
-            "signals": signals,
-            "count": len(signals),
-            "timestamp": datetime.now().isoformat(),
-            "status": "success"
-        })
+        return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat(), "status": "success", "from_cache": False})
         
     except Exception as e:
         logging.error(f"Erro GERAL e inesperado na rota /signals: {e}")
-        return jsonify({
-            "error": f"Falha crítica ao gerar sinais: {str(e)}",
-            "timestamp": datetime.now().isoformat(),
-            "status": "error"
-        }), 500
+        return jsonify({"error": f"Falha crítica ao gerar sinais: {str(e)}", "timestamp": datetime.now().isoformat(), "status": "error"}), 500
 
 @app.route("/health")
 def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    })
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 # --- EXECUÇÃO DA APLICAÇÃO ---
 
