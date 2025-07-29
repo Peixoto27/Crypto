@@ -1,473 +1,109 @@
-/* ==========================================================================
-   Configurações Globais e Variáveis
-   ========================================================================== */
-:root {
-    --bg-primary: #121212;
-    --bg-secondary: #1e1e1e;
-    --bg-card: #2a2a2a;
-    --text-primary: #e0e0e0;
-    --text-secondary: #b0b0b0;
-    --text-muted: #888888;
-    --border-color: #3a3a3a;
-    --buy-color: #28a745;
-    --sell-color: #dc3545;
-    --hold-color: #6c757d;
-    --accent-color: #007bff;
-    --success-color: #28a745;
-    --error-color: #dc3545;
-    --warning-color: #ffc107;
+.app-container {
+  padding: 20px;
+  max-width: 1200px;
+  margin: 0 auto;
 }
 
-body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-    background-color: var(--bg-primary);
-    color: var(--text-primary);
-    margin: 0;
-    padding: 20px;
-    line-height: 1.6;
+.app-header {
+  text-align: center;
+  margin-bottom: 40px;
+  color: #e0e0e0;
 }
 
-/* ==========================================================================
-   Tela de Login
-   ========================================================================== */
-#login-screen {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    height: 100vh;
-    flex-direction: column;
+.app-header h1 {
+  font-size: 2.5rem;
+  margin-bottom: 10px;
 }
 
-.login-box {
-    background-color: var(--bg-secondary);
-    padding: 40px;
-    border-radius: 12px;
-    text-align: center;
-    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
+.app-header p {
+  font-size: 1.1rem;
+  color: #b0b0b0;
 }
 
-.login-box h2 {
-    margin-top: 0;
-    margin-bottom: 20px;
-    color: var(--text-primary);
+.status-container {
+  text-align: center;
+  padding: 50px;
+  color: #e0e0e0;
 }
 
-.login-box input {
-    width: 100%;
-    padding: 12px;
-    margin-bottom: 15px;
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    background-color: var(--bg-card);
-    color: var(--text-primary);
-    font-size: 16px;
+.error-message {
+  color: #ff6b6b;
+  background-color: #2e1a1a;
+  padding: 10px;
+  border-radius: 5px;
 }
 
-.login-box button {
-    width: 100%;
-    padding: 12px;
-    background-color: var(--accent-color);
-    color: white;
-    border: none;
-    border-radius: 6px;
-    font-size: 16px;
-    cursor: pointer;
-    transition: background-color 0.3s;
-}
-
-.login-box button:hover {
-    background-color: #0056b3;
-}
-
-/* ==========================================================================
-   Aplicação Principal
-   ========================================================================== */
-#app {
-    display: none;
-    max-width: 1400px;
-    margin: 0 auto;
-}
-
-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 30px;
-    padding: 20px 0;
-    border-bottom: 1px solid var(--border-color);
-}
-
-header h1 {
-    margin: 0;
-    color: var(--text-primary);
-    font-size: 2rem;
-}
-
-.controls {
-    display: flex;
-    align-items: center;
-    gap: 20px;
-}
-
-#last-updated-timestamp {
-    color: var(--text-secondary);
-    font-size: 0.9rem;
-}
-
-.timeframe-selector {
-    display: flex;
-    gap: 5px;
-}
-
-.timeframe-selector button {
-    padding: 8px 16px;
-    border: 1px solid var(--border-color);
-    background-color: var(--bg-card);
-    color: var(--text-secondary);
-    border-radius: 6px;
-    cursor: pointer;
-    transition: all 0.3s;
-}
-
-.timeframe-selector button:hover {
-    background-color: var(--bg-secondary);
-    color: var(--text-primary);
-}
-
-.timeframe-selector button.active {
-    background-color: var(--accent-color);
-    color: white;
-    border-color: var(--accent-color);
-}
-
-#alerts-btn {
-    padding: 8px 16px;
-    background-color: var(--accent-color);
-    color: white;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: background-color 0.3s;
-}
-
-#alerts-btn:hover {
-    background-color: #0056b3;
-}
-
-/* ==========================================================================
-   Grid de Sinais
-   ========================================================================== */
 .signals-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-    gap: 20px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 20px;
 }
 
 .signal-card {
-    background-color: var(--bg-card);
-    border-radius: 12px;
-    padding: 20px;
-    border: 1px solid var(--border-color);
-    transition: transform 0.3s, box-shadow 0.3s;
+  background-color: #1e1e1e;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 20px;
+  transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
 }
 
 .signal-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+  transform: translateY(-5px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
 }
 
-.card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 15px;
+.pair-name {
+  margin-top: 0;
+  margin-bottom: 15px;
+  text-align: center;
+  color: #ffffff;
+  font-size: 1.5rem;
 }
 
-.card-header h3 {
-    margin: 0;
-    color: var(--text-primary);
-    font-size: 1.2rem;
+.signal-display {
+  text-align: center;
+  font-size: 1.2rem;
+  font-weight: bold;
+  padding: 10px;
+  border-radius: 5px;
+  margin-bottom: 15px;
+  color: #fff;
 }
 
-.signal-badge {
-    padding: 4px 12px;
-    border-radius: 20px;
-    font-size: 0.8rem;
-    font-weight: bold;
-    text-transform: uppercase;
+/* Cores para os sinais */
+.signal-display.buy {
+  background-color: #28a745; /* Verde */
 }
 
-.signal-badge.buy {
-    background-color: var(--buy-color);
-    color: white;
+.signal-display.sell {
+  background-color: #dc3545; /* Vermelho */
 }
 
-.signal-badge.sell {
-    background-color: var(--sell-color);
-    color: white;
+.signal-display.hold {
+  background-color: #6c757d; /* Cinza */
 }
 
-.signal-badge.hold {
-    background-color: var(--hold-color);
-    color: white;
-}
-
-.price-info {
-    margin-bottom: 15px;
-}
-
-.price-row {
-    display: flex;
-    justify-content: space-between;
-    margin-bottom: 8px;
-}
-
-.price-row .label {
-    color: var(--text-secondary);
-}
-
-.price-row .value {
-    color: var(--text-primary);
-    font-weight: 500;
-}
-
-.metrics {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 10px;
-    margin-bottom: 15px;
-}
-
-.metric {
-    text-align: center;
-    padding: 8px;
-    background-color: var(--bg-secondary);
-    border-radius: 6px;
-}
-
-.metric-label {
-    display: block;
-    font-size: 0.8rem;
-    color: var(--text-secondary);
-    margin-bottom: 2px;
-}
-
-.metric-value {
-    display: block;
-    font-weight: bold;
-    color: var(--text-primary);
+.signal-display.error {
+  background-color: #ffc107; /* Amarelo */
+  color: #1e1e1e;
 }
 
 .signal-details {
-    margin-bottom: 15px;
-    padding: 10px;
-    background-color: var(--bg-secondary);
-    border-radius: 6px;
+  font-size: 1rem;
+  line-height: 1.6;
 }
 
-.signal-description {
-    color: var(--text-secondary);
-    font-size: 0.85rem;
-    line-height: 1.4;
+.signal-details p {
+  margin: 5px 0;
+  display: flex;
+  justify-content: space-between;
 }
 
-.card-footer {
-    display: flex;
-    justify-content: center;
+.signal-details strong {
+  color: #a0a0a0;
 }
 
-.alert-btn {
-    padding: 8px 16px;
-    background-color: var(--accent-color);
-    color: white;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 0.9rem;
-    transition: background-color 0.3s;
+.error-details {
+  font-size: 0.9rem;
+  font-style: italic;
 }
-
-.alert-btn:hover {
-    background-color: #0056b3;
-}
-
-/* ==========================================================================
-   Estados de Carregamento e Erro
-   ========================================================================== */
-.loading {
-    text-align: center;
-    padding: 40px;
-    color: var(--text-secondary);
-    font-size: 1.1rem;
-}
-
-.error {
-    text-align: center;
-    padding: 40px;
-    color: var(--error-color);
-    font-size: 1.1rem;
-    background-color: rgba(220, 53, 69, 0.1);
-    border-radius: 8px;
-    border: 1px solid var(--error-color);
-}
-
-.warning {
-    text-align: center;
-    padding: 15px;
-    color: #856404;
-    background-color: rgba(255, 193, 7, 0.1);
-    border: 1px solid var(--warning-color);
-    border-radius: 8px;
-    margin-bottom: 20px;
-}
-
-.no-data {
-    text-align: center;
-    padding: 40px;
-    color: var(--text-secondary);
-    font-size: 1.1rem;
-}
-
-/* ==========================================================================
-   Modal de Alertas
-   ========================================================================== */
-.modal {
-    display: none;
-    position: fixed;
-    z-index: 1000;
-    left: 0;
-    top: 0;
-    width: 100%;
-    height: 100%;
-    background-color: rgba(0, 0, 0, 0.5);
-}
-
-.modal-content {
-    background-color: var(--bg-secondary);
-    margin: 5% auto;
-    padding: 30px;
-    border-radius: 12px;
-    width: 90%;
-    max-width: 500px;
-    position: relative;
-}
-
-.close {
-    position: absolute;
-    right: 15px;
-    top: 15px;
-    font-size: 28px;
-    font-weight: bold;
-    color: var(--text-secondary);
-    cursor: pointer;
-}
-
-.close:hover {
-    color: var(--text-primary);
-}
-
-.modal h2 {
-    margin-top: 0;
-    color: var(--text-primary);
-}
-
-#add-alert-form {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-}
-
-#add-alert-form input,
-#add-alert-form select {
-    flex: 1;
-    min-width: 120px;
-    padding: 8px;
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    background-color: var(--bg-card);
-    color: var(--text-primary);
-}
-
-#add-alert-form button {
-    padding: 8px 16px;
-    background-color: var(--success-color);
-    color: white;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-}
-
-.alert-item {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 10px;
-    margin-bottom: 10px;
-    background-color: var(--bg-card);
-    border-radius: 6px;
-}
-
-.alert-info {
-    display: flex;
-    flex-direction: column;
-}
-
-.remove-btn {
-    background-color: var(--error-color);
-    color: white;
-    border: none;
-    border-radius: 4px;
-    padding: 5px 8px;
-    cursor: pointer;
-}
-
-/* ==========================================================================
-   Responsividade
-   ========================================================================== */
-@media (max-width: 768px) {
-    body {
-        padding: 10px;
-    }
-    
-    header {
-        flex-direction: column;
-        gap: 15px;
-        text-align: center;
-    }
-    
-    .controls {
-        flex-direction: column;
-        gap: 10px;
-    }
-    
-    .signals-grid {
-        grid-template-columns: 1fr;
-        gap: 15px;
-    }
-    
-    .signal-card {
-        padding: 15px;
-    }
-    
-    .metrics {
-        grid-template-columns: 1fr;
-        gap: 8px;
-    }
-    
-    .timeframe-selector {
-        flex-wrap: wrap;
-        justify-content: center;
-    }
-    
-    #add-alert-form {
-        flex-direction: column;
-    }
-    
-    .modal-content {
-        margin: 10% auto;
-        width: 95%;
-        padding: 20px;
-    }
-}
-
