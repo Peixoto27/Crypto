@@ -14,78 +14,70 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
-config = {
-    "CACHE_TYPE": "SimpleCache",
-    "CACHE_DEFAULT_TIMEOUT": 21600  # 6 horas
-}
+config = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 21600}
 app.config.from_mapping(config)
 cache = Cache(app)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 COINGECKO_MAP = {
-    "BTCUSDT": "bitcoin",
-    "ETHUSDT": "ethereum",
-    "XRPUSDT": "ripple",
-    "SOLUSDT": "solana",
-    "ADAUSDT": "cardano"
+    "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
+    "SOLUSDT": "solana", "ADAUSDT": "cardano"
 }
 
 # --- LÓGICA PRINCIPAL ---
 
 def get_technical_signal(symbol):
     """
-    Busca dados de preço E VOLUME, calcula indicadores e gera um sinal robusto.
+    Busca dados de preço e volume de um único endpoint, calcula indicadores e gera um sinal.
     """
     try:
         coingecko_id = COINGECKO_MAP.get(symbol)
         if not coingecko_id:
             raise Exception(f"Símbolo {symbol} não mapeado.")
 
-        # --- 1. BUSCAR DADOS DE PREÇO E VOLUME (DE DOIS ENDPOINTS) ---
+        # --- 1. BUSCAR DADOS DE UM ÚNICO ENDPOINT MAIS ROBUSTO ---
         days_to_fetch = 90
-        logging.info(f"Buscando dados para {symbol} (ID: {coingecko_id})")
-
-        # Endpoint de Preço (OHLC)
-        price_url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/ohlc?vs_currency=usd&days={days_to_fetch}'
-        price_data = requests.get(price_url, timeout=15 ).json()
+        logging.info(f"Buscando dados de mercado para {symbol} (ID: {coingecko_id})")
         
-        # Endpoint de Volume
-        volume_url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days={days_to_fetch}&interval=daily'
-        market_data = requests.get(volume_url, timeout=15 ).json()
+        url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days={days_to_fetch}&interval=daily'
+        response = requests.get(url, timeout=15 )
+        response.raise_for_status()
+        market_data = response.json()
 
-        if not price_data or 'total_volumes' not in market_data:
+        if 'prices' not in market_data or 'total_volumes' not in market_data:
             raise Exception("Dados da API incompletos.")
 
-        # --- 2. PROCESSAR E COMBINAR OS DADOS ---
-        df_price = pd.DataFrame(price_data, columns=['timestamp', 'open', 'high', 'low', 'close'])
-        df_price['date'] = pd.to_datetime(df_price['timestamp'], unit='ms').dt.date
-
-        df_volume = pd.DataFrame(market_data['total_volumes'], columns=['timestamp', 'volume'])
-        df_volume['date'] = pd.to_datetime(df_volume['timestamp'], unit='ms').dt.date
+        # --- 2. PROCESSAR DADOS DIRETAMENTE (SEM MERGE) ---
+        df_prices = pd.DataFrame(market_data['prices'], columns=['timestamp', 'close'])
+        df_volumes = pd.DataFrame(market_data['total_volumes'], columns=['timestamp', 'volume'])
         
-        # Combina os dois DataFrames com base na data
-        df = pd.merge(df_price, df_volume[['date', 'volume']], on='date', how='inner')
+        # Usa o timestamp como índice para combinar os dados de forma segura
+        df_prices.set_index('timestamp', inplace=True)
+        df_volumes.set_index('timestamp', inplace=True)
+        df = df_prices.join(df_volumes, how='inner')
+        df.reset_index(inplace=True)
 
-        # --- 3. CALCULAR INDICADORES (INCLUINDO MÉDIA DE VOLUME) ---
+        if df.empty:
+            raise Exception("DataFrame vazio após combinar preços e volumes.")
+
+        # --- 3. CALCULAR INDICADORES ---
         df.ta.rsi(length=14, append=True)
-        df.ta.sma(length=10, append=True)
-        df.ta.sma(length=30, append=True)
-        # Calcula a média móvel do volume dos últimos 20 dias
+        df.ta.sma(close='close', length=10, append=True)
+        df.ta.sma(close='close', length=30, append=True)
         df['volume_sma_20'] = df['volume'].rolling(window=20).mean()
 
         df.dropna(inplace=True)
         if df.empty:
-            raise Exception("Dados insuficientes para análise.")
+            raise Exception("Dados insuficientes para análise após cálculos.")
 
-        # --- 4. GERAR SINAL COM A NOVA LÓGICA DE VOLUME ---
+        # --- 4. GERAR SINAL COM LÓGICA DE VOLUME ---
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2]
 
         signal_type = "HOLD"
         confidence = ""
         
-        # Condição de Volume: Volume atual é pelo menos 20% maior que a média
         volume_check = last_row['volume'] > (last_row['volume_sma_20'] * 1.20)
         if volume_check:
             confidence = " (Volume Forte)"
@@ -96,22 +88,17 @@ def get_technical_signal(symbol):
         prev_sma_short = prev_row['SMA_10']
         prev_sma_long = prev_row['SMA_30']
 
-        # Lógica de Compra: Cruzamento de alta + RSI não sobrecomprado + Confirmação de Volume
         if sma_short > sma_long and prev_sma_short <= prev_sma_long and rsi_value < 70 and volume_check:
             signal_type = "BUY"
-        # Lógica de Venda: Cruzamento de baixa + RSI não sobrevendido + Confirmação de Volume
         elif sma_short < sma_long and prev_sma_short >= prev_sma_long and rsi_value > 30 and volume_check:
             signal_type = "SELL"
         
         entry_price = float(last_row['close'])
         
         return {
-            "pair": symbol.replace("USDT", "/USDT"),
-            "entry": round(entry_price, 4),
-            "signal": f"{signal_type}{confidence}",
-            "stop": round(entry_price * 0.98, 4),
-            "target": round(entry_price * 1.03, 4),
-            "rsi": round(rsi_value, 2),
+            "pair": symbol.replace("USDT", "/USDT"), "entry": round(entry_price, 4),
+            "signal": f"{signal_type}{confidence}", "stop": round(entry_price * 0.98, 4),
+            "target": round(entry_price * 1.03, 4), "rsi": round(rsi_value, 2),
             "timestamp": datetime.now().isoformat()
         }
 
@@ -123,7 +110,7 @@ def get_technical_signal(symbol):
 
 @app.route("/")
 def home():
-    return jsonify({"message": "Crypton Signals API v2 (with Volume Analysis)", "status": "online"})
+    return jsonify({"message": "Crypton Signals API v2.1 (Robust Data Fetching)", "status": "online"})
 
 @app.route("/signals")
 @cache.cached()
@@ -133,18 +120,15 @@ def get_signals():
         symbols_to_process = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT"]
         signals = []
         for symbol in symbols_to_process:
-            # Agora cada símbolo faz 2 chamadas, então a pausa é ainda mais importante
-            time.sleep(2) 
             signal = get_technical_signal(symbol)
             signals.append(signal)
+            time.sleep(1.2) # Pausa reduzida, pois só fazemos 1 chamada por moeda
         
         return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat(), "status": "success"})
         
     except Exception as e:
         logging.error(f"Erro GERAL na rota /signals: {e}")
         return jsonify({"error": f"Falha crítica ao gerar sinais: {str(e)}", "status": "error"}), 500
-
-# O resto do código (health_check, __main__) permanece o mesmo...
 
 @app.route("/health")
 def health_check():
