@@ -2,14 +2,13 @@ import React, { useState, useEffect } from 'react';
 import ReactDOM from 'react-dom';
 import './App.css';
 
-// URL da nossa API na Railway
-const API_URL = 'https://crypto-production-8861.up.railway.app'; // Substitua se o nome do seu serviço mudou
+// ✅ URL DA API ATUALIZADO COM O SEU NOVO ENDEREÇO
+const API_URL = 'https://reliable-mercy-production.up.railway.app';
 
 // --- COMPONENTE MODAL (POPUP ) ---
 const Modal = ({ isOpen, onClose, title, children }) => {
   if (!isOpen) return null;
 
-  // Usamos um Portal para renderizar o modal fora da hierarquia principal do DOM
   return ReactDOM.createPortal(
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={e => e.stopPropagation()}>
@@ -38,7 +37,6 @@ function App() {
     const fetchData = async () => {
       try {
         setLoading(true);
-        // Busca os sinais atuais e o histórico em paralelo
         const [signalsResponse, historyResponse] = await Promise.all([
           fetch(`${API_URL}/signals`),
           fetch(`${API_URL}/signals/history`)
