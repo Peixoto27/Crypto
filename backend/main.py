@@ -59,7 +59,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v3.5 (Final Fix)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v3.6 (Final Indent Fix)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -91,7 +91,7 @@ def create_app():
         @app.route("/setup/database/create-tables-secret-path")
         def setup_database():
             try:
-                with app.app_context(): # ✅ A CORREÇÃO ESTÁ AQUI
+                with app.app_context():
                     db.create_all()
                 return jsonify({"message": "SUCESSO: As tabelas da base de dados foram criadas (ou já existiam)."}), 200
             except Exception as e:
@@ -124,6 +124,7 @@ def create_app():
                 logging.error(f"Falha ao salvar sinal no histórico para {pair_name}: {e}")
                 db.session.rollback()
 
+        # ✅ CORREÇÃO: Esta função foi movida para dentro do 'with app.app_context()'
         def get_technical_signal(symbol):
             try:
                 coingecko_id = COINGECKO_MAP.get(symbol)
@@ -171,14 +172,4 @@ if __name__ == "__main__":
         db.create_all()
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando servidor na porta {port}")
-    app.run(debug=False, host='0.0.0.0', port=port)```
-
-**A Sequência de Inicialização (A Fazer Novamente):**
-
-1.  **Faça o deploy** deste novo código.
-2.  **Aceda ao URL de setup:** `https://reliable-mercy-production.up.railway.app/setup/database/create-tables-secret-path`
-3.  **Aceda ao URL de limpeza de cache:** `https://reliable-mercy-production.up.railway.app/admin/cache/clear-secret-path`
-4.  **Recarregue o seu site do frontend com a cache limpa** (F12 -> Segurar no botão de recarregar -> "Esvaziar cache e recarregamento forçado" ).
-
-Desta vez, o `db.create_all()` será executado corretamente, a tabela será criada, os sinais serão salvos, e o histórico irá carregar.
-
+    app.run(debug=False, host='0.0.0.0', port=port)
