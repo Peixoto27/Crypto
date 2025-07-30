@@ -41,14 +41,10 @@ def create_app():
     cache_config = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 21600}
     app.config.from_mapping(cache_config)
 
-    # --- ✅ CORREÇÃO APLICADA AQUI ---
-    # Verifica se a variável de ambiente DATABASE_URL existe ANTES de tentar usá-la.
     db_url = os.environ.get('DATABASE_URL')
     if not db_url:
-        # Se a variável não existir, lança um erro claro e impede a app de iniciar.
         raise RuntimeError("ERRO CRÍTICO: A variável de ambiente DATABASE_URL não foi encontrada.")
     
-    # Converte 'postgres://' para 'postgresql://' se necessário
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     
@@ -62,7 +58,6 @@ def create_app():
 
     # --- REGISTO DAS ROTAS (BLUEPRINTS) ---
     with app.app_context():
-        # (O resto do código das rotas e lógica de sinais permanece o mesmo)
         COINGECKO_MAP = {
             "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
             "SOLUSDT": "solana", "ADAUSDT": "cardano"
@@ -70,7 +65,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v3.2 (Robust)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v3.3 (With Setup Endpoint)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -98,6 +93,17 @@ def create_app():
             except Exception as e:
                 logging.error(f"Erro ao buscar histórico da base de dados: {e}")
                 return jsonify({"error": "Não foi possível buscar o histórico."}), 500
+
+        # --- ✅ ROTA SECRETA PARA CRIAR AS TABELAS ---
+        @app.route("/setup/database/create-tables-secret-path")
+        def setup_database():
+            try:
+                # Usamos o app_context para garantir que estamos no contexto correto da aplicação
+                db.create_all()
+                return jsonify({"message": "SUCESSO: As tabelas da base de dados foram criadas (ou já existiam)."}), 200
+            except Exception as e:
+                logging.error(f"ERRO AO CRIAR TABELAS: {e}")
+                return jsonify({"error": str(e)}), 500
 
         def salvar_sinal_no_historico(sinal_data):
             try:
@@ -159,6 +165,7 @@ def create_app():
 # --- PONTO DE ENTRADA DA APLICAÇÃO ---
 app = create_app()
 
+# O bloco abaixo não é executado pela Railway, por isso a necessidade do endpoint de setup
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
