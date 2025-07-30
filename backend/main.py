@@ -10,12 +10,10 @@ import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
 
-# --- INICIALIZAÇÃO DAS EXTENSÕES ---
 db = SQLAlchemy()
 cache = Cache()
 cors = CORS()
 
-# --- MODELO DA BASE DE DADOS ---
 class SinalHistorico(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     pair = db.Column(db.String(20), nullable=False)
@@ -32,12 +30,10 @@ class SinalHistorico(db.Model):
             data['timestamp'] = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
         return data
 
-# --- FUNÇÃO DE CRIAÇÃO DA APLICAÇÃO (APPLICATION FACTORY) ---
 def create_app():
     app = Flask(__name__)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    # --- CONFIGURAÇÃO DA APP ---
     cache_config = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 21600}
     app.config.from_mapping(cache_config)
 
@@ -51,12 +47,10 @@ def create_app():
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-    # --- LIGA AS EXTENSÕES À APLICAÇÃO ---
     db.init_app(app)
     cache.init_app(app)
     cors.init_app(app)
 
-    # --- REGISTO DAS ROTAS (BLUEPRINTS) ---
     with app.app_context():
         COINGECKO_MAP = {
             "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
@@ -65,7 +59,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v3.4 (Final)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v3.5 (Final Fix)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -97,13 +91,13 @@ def create_app():
         @app.route("/setup/database/create-tables-secret-path")
         def setup_database():
             try:
-                db.create_all()
+                with app.app_context(): # ✅ A CORREÇÃO ESTÁ AQUI
+                    db.create_all()
                 return jsonify({"message": "SUCESSO: As tabelas da base de dados foram criadas (ou já existiam)."}), 200
             except Exception as e:
                 logging.error(f"ERRO AO CRIAR TABELAS: {e}")
                 return jsonify({"error": str(e)}), 500
         
-        # --- ✅ ROTA SECRETA PARA LIMPAR A CACHE ---
         @app.route("/admin/cache/clear-secret-path")
         def clear_cache():
             try:
@@ -170,7 +164,6 @@ def create_app():
 
     return app
 
-# --- PONTO DE ENTRADA DA APLICAÇÃO ---
 app = create_app()
 
 if __name__ == "__main__":
@@ -178,4 +171,13 @@ if __name__ == "__main__":
         db.create_all()
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando servidor na porta {port}")
-    app.run(debug=False, host='0.0.0.0', port=port)
+    app.run(debug=False, host='0.0.0.0', port=port)```
+
+**A Sequência de Inicialização (A Fazer Novamente):**
+
+1.  **Faça o deploy** deste novo código.
+2.  **Aceda ao URL de setup:** `https://reliable-mercy-production.up.railway.app/setup/database/create-tables-secret-path`
+3.  **Aceda ao URL de limpeza de cache:** `https://reliable-mercy-production.up.railway.app/admin/cache/clear-secret-path`
+4.  **Recarregue o seu site do frontend com a cache limpa** (F12 -> Segurar no botão de recarregar -> "Esvaziar cache e recarregamento forçado" ).
+
+Desta vez, o `db.create_all()` será executado corretamente, a tabela será criada, os sinais serão salvos, e o histórico irá carregar.
