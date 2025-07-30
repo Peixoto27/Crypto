@@ -65,7 +65,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v3.3 (With Setup Endpoint)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v3.4 (Final)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -94,15 +94,23 @@ def create_app():
                 logging.error(f"Erro ao buscar histórico da base de dados: {e}")
                 return jsonify({"error": "Não foi possível buscar o histórico."}), 500
 
-        # --- ✅ ROTA SECRETA PARA CRIAR AS TABELAS ---
         @app.route("/setup/database/create-tables-secret-path")
         def setup_database():
             try:
-                # Usamos o app_context para garantir que estamos no contexto correto da aplicação
                 db.create_all()
                 return jsonify({"message": "SUCESSO: As tabelas da base de dados foram criadas (ou já existiam)."}), 200
             except Exception as e:
                 logging.error(f"ERRO AO CRIAR TABELAS: {e}")
+                return jsonify({"error": str(e)}), 500
+        
+        # --- ✅ ROTA SECRETA PARA LIMPAR A CACHE ---
+        @app.route("/admin/cache/clear-secret-path")
+        def clear_cache():
+            try:
+                cache.clear()
+                return jsonify({"message": "SUCESSO: A cache foi limpa."}), 200
+            except Exception as e:
+                logging.error(f"ERRO AO LIMPAR A CACHE: {e}")
                 return jsonify({"error": str(e)}), 500
 
         def salvar_sinal_no_historico(sinal_data):
@@ -165,7 +173,6 @@ def create_app():
 # --- PONTO DE ENTRADA DA APLICAÇÃO ---
 app = create_app()
 
-# O bloco abaixo não é executado pela Railway, por isso a necessidade do endpoint de setup
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
