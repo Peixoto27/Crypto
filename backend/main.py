@@ -181,3 +181,4 @@ if __name__ == "__main__":
 4.  **Recarregue o seu site do frontend com a cache limpa** (F12 -> Segurar no botão de recarregar -> "Esvaziar cache e recarregamento forçado" ).
 
 Desta vez, o `db.create_all()` será executado corretamente, a tabela será criada, os sinais serão salvos, e o histórico irá carregar.
+
