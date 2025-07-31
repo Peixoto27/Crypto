@@ -70,6 +70,17 @@ def create_app():
                 daily_response.raise_for_status()
                 daily_data = daily_response.json()
 
+                # ✅ PAUSA INTELIGENTE AQUI
+                logging.info("Pausa de 2 segundos para respeitar a API...")
+                time.sleep(2) 
+
+                logging.info(f"Buscando dados SEMANAIS para {symbol}")
+                weekly_url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
+                weekly_response = requests.get(weekly_url, timeout=15 )
+                weekly_response.raise_for_status()
+                weekly_data = weekly_response.json()
+                
+                # O resto da lógica de análise permanece o mesmo
                 df_daily = pd.DataFrame(daily_data['prices'], columns=['timestamp', 'close'])
                 df_daily_volumes = pd.DataFrame(daily_data['total_volumes'], columns=['timestamp', 'volume'])
                 df_daily.set_index('timestamp', inplace=True)
@@ -87,12 +98,6 @@ def create_app():
                 if df_daily.empty: raise Exception("Dados diários insuficientes para análise.")
 
                 last_daily, prev_daily = df_daily.iloc[-1], df_daily.iloc[-2]
-                
-                logging.info(f"Buscando dados SEMANAIS para {symbol}")
-                weekly_url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
-                weekly_response = requests.get(weekly_url, timeout=15 )
-                weekly_response.raise_for_status()
-                weekly_data = weekly_response.json()
                 
                 df_weekly = pd.DataFrame(weekly_data['prices'], columns=['timestamp', 'close'])
                 df_weekly['date'] = pd.to_datetime(df_weekly['timestamp'], unit='ms')
@@ -164,7 +169,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v5.1 (Rate Limit Fix)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v5.2 (Smarter Rate Limit Fix)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -176,7 +181,8 @@ def create_app():
                 signals.append(signal)
                 if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
                     salvar_sinal_no_historico(signal)
-                time.sleep(4) # Pausa aumentada para respeitar o limite de taxa da API
+                # Mantemos uma pequena pausa entre as moedas, por segurança
+                time.sleep(1) 
             return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
         @app.route("/signals/history")
