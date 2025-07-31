@@ -60,33 +60,40 @@ def create_app():
             "SOLUSDT": "solana", "ADAUSDT": "cardano"
         }
 
+        def get_coingecko_data_with_retry(url, retries=3, backoff_factor=3):
+            for i in range(retries):
+                try:
+                    response = requests.get(url, timeout=20)
+                    response.raise_for_status()
+                    return response.json()
+                except requests.exceptions.HTTPError as e:
+                    if e.response.status_code == 429:
+                        wait_time = backoff_factor * (2 ** i)
+                        logging.warning(f"Erro 429 - Too Many Requests. Tentando novamente em {wait_time} segundos...")
+                        time.sleep(wait_time)
+                    else:
+                        raise e
+            raise Exception(f"Falha ao buscar dados após {retries} tentativas.")
+
         def get_technical_signal(symbol):
             try:
                 coingecko_id = COINGECKO_MAP.get(symbol)
                 
-                logging.info(f"Buscando dados DIÁRIOS para {symbol}")
-                daily_url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
-                daily_response = requests.get(daily_url, timeout=15 )
-                daily_response.raise_for_status()
-                daily_data = daily_response.json()
+                logging.info(f"Buscando dados de 365 dias para {symbol} (chamada única otimizada)")
+                # ✅ UMA ÚNICA CHAMADA PARA OBTER TODOS OS DADOS
+                url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
+                all_data = get_coingecko_data_with_retry(url )
 
-                # ✅ PAUSA INTELIGENTE AQUI
-                logging.info("Pausa de 2 segundos para respeitar a API...")
-                time.sleep(2) 
+                # Processamento dos dados (como antes, mas agora a partir de uma única fonte)
+                df_full = pd.DataFrame(all_data['prices'], columns=['timestamp', 'close'])
+                df_full_volumes = pd.DataFrame(all_data['total_volumes'], columns=['timestamp', 'volume'])
+                df_full.set_index('timestamp', inplace=True)
+                df_full_volumes.set_index('timestamp', inplace=True)
+                df_full = df_full.join(df_full_volumes, how='inner').reset_index()
+                df_full['date'] = pd.to_datetime(df_full['timestamp'], unit='ms')
 
-                logging.info(f"Buscando dados SEMANAIS para {symbol}")
-                weekly_url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
-                weekly_response = requests.get(weekly_url, timeout=15 )
-                weekly_response.raise_for_status()
-                weekly_data = weekly_response.json()
-                
-                # O resto da lógica de análise permanece o mesmo
-                df_daily = pd.DataFrame(daily_data['prices'], columns=['timestamp', 'close'])
-                df_daily_volumes = pd.DataFrame(daily_data['total_volumes'], columns=['timestamp', 'volume'])
-                df_daily.set_index('timestamp', inplace=True)
-                df_daily_volumes.set_index('timestamp', inplace=True)
-                df_daily = df_daily.join(df_daily_volumes, how='inner').reset_index()
-
+                # 1. ANÁLISE DIÁRIA (usando os últimos 90 dias dos dados completos)
+                df_daily = df_full.tail(90).copy()
                 if df_daily.empty: raise Exception("DataFrame diário vazio.")
                 
                 df_daily.ta.rsi(length=14, append=True)
@@ -96,25 +103,20 @@ def create_app():
                 df_daily['volume_sma_20'] = df_daily['volume'].rolling(window=20).mean()
                 df_daily.dropna(inplace=True)
                 if df_daily.empty: raise Exception("Dados diários insuficientes para análise.")
-
                 last_daily, prev_daily = df_daily.iloc[-1], df_daily.iloc[-2]
-                
-                df_weekly = pd.DataFrame(weekly_data['prices'], columns=['timestamp', 'close'])
-                df_weekly['date'] = pd.to_datetime(df_weekly['timestamp'], unit='ms')
-                df_weekly = df_weekly.resample('W-SUN', on='date').last()
-                
+
+                # 2. ANÁLISE SEMANAL (usando todos os 365 dias de dados)
+                df_weekly = df_full.resample('W-SUN', on='date').last()
                 if df_weekly.empty: raise Exception("DataFrame semanal vazio.")
-                
                 df_weekly['SMA_10_weekly'] = df_weekly['close'].rolling(window=10).mean()
                 df_weekly.dropna(inplace=True)
                 if df_weekly.empty: raise Exception("Dados semanais insuficientes para SMA_10.")
-                
                 last_weekly = df_weekly.iloc[-1]
                 
+                # 3. LÓGICA DE SINAL (exatamente como antes)
                 signal_type = "HOLD"
                 confidence = ""
                 entry_price = float(last_daily['close'])
-
                 is_in_squeeze = last_daily.get('BBB_20_2.0', 1) < 0.1
                 if is_in_squeeze:
                     signal_type = "ALERTA"
@@ -126,10 +128,8 @@ def create_app():
                     rsi_check_sell = last_daily.get('RSI_14', 50) > 30
                     volume_check = last_daily['volume'] > (last_daily['volume_sma_20'] * 1.20)
                     weekly_trend_is_up = last_weekly['close'] > last_weekly['SMA_10_weekly']
-                    
                     price_not_overextended_buy = last_daily.get('BBP_20_2.0', 0.5) < 0.95
                     price_not_overextended_sell = last_daily.get('BBP_20_2.0', 0.5) > 0.05
-
                     if daily_buy_condition and rsi_check_buy and volume_check and weekly_trend_is_up and price_not_overextended_buy:
                         signal_type = "BUY"
                         confidence = " (Tendência Semanal OK)"
@@ -169,22 +169,23 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v5.2 (Smarter Rate Limit Fix)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v6.0 (Robust & Optimized)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
         def get_signals():
-            logging.info("CACHE MISS: Gerando novos sinais (com Bollinger Bands) e salvando no histórico.")
+            logging.info("CACHE MISS: Gerando novos sinais (Otimizado) e salvando no histórico.")
             signals = []
             for symbol in COINGECKO_MAP.keys():
                 signal = get_technical_signal(symbol)
                 signals.append(signal)
                 if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
                     salvar_sinal_no_historico(signal)
-                # Mantemos uma pequena pausa entre as moedas, por segurança
-                time.sleep(1) 
+                # ✅ PAUSA FINAL E CONSERVADORA
+                time.sleep(5) 
             return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
+        # O resto das rotas (/history, /setup, /admin) permanecem as mesmas
         @app.route("/signals/history")
         def get_history():
             try:
