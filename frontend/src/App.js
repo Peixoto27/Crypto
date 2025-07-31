@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import ReactDOM from 'react-dom';
 import './App.css';
 
-// ✅ URL DA API ATUALIZADO COM O SEU NOVO ENDEREÇO
+// URL da nossa API na Railway
 const API_URL = 'https://reliable-mercy-production.up.railway.app';
 
 // --- COMPONENTE MODAL (POPUP ) ---
@@ -76,6 +76,7 @@ function App() {
   const getSignalClass = (signal) => {
     if (signal.toLowerCase().includes('buy')) return 'buy';
     if (signal.toLowerCase().includes('sell')) return 'sell';
+    if (signal.toLowerCase().includes('alerta')) return 'alert'; // ✅ NOVO: Classe para Alertas
     if (signal.toLowerCase().includes('hold')) return 'hold';
     return 'error';
   };
@@ -110,6 +111,13 @@ function App() {
                 <p><strong>Alvo:</strong> <span>${signal.target?.toFixed(4)}</span></p>
                 <p><strong>Stop:</strong> <span>${signal.stop?.toFixed(4)}</span></p>
                 <p><strong>RSI:</strong> <span>{signal.rsi?.toFixed(2)}</span></p>
+                {/* ✅ NOVO: Exibe os dados das Bandas de Bollinger se existirem */}
+                {signal.bb_upper > 0 && (
+                  <p className="bollinger-bands">
+                    <strong>BB:</strong> 
+                    <span>${signal.bb_lower?.toFixed(4)} - ${signal.bb_upper?.toFixed(4)}</span>
+                  </p>
+                )}
               </div>
 
               <button className="history-button" onClick={() => openHistoryModal(signal.pair)}>
