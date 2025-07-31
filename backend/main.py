@@ -10,12 +10,12 @@ import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
 
-# --- INICIALIZAÇÃO (igual a antes) ---
+# --- INICIALIZAÇÃO ---
 db = SQLAlchemy()
 cache = Cache()
 cors = CORS()
 
-# --- MODELO DA BASE DE DADOS (igual a antes) ---
+# --- MODELO DA BASE DE DADOS ---
 class SinalHistorico(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     pair = db.Column(db.String(20), nullable=False)
@@ -37,7 +37,7 @@ def create_app():
     app = Flask(__name__)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    # Configurações (iguais a antes)
+    # Configurações
     cache_config = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 21600}
     app.config.from_mapping(cache_config)
     db_url = os.environ.get('DATABASE_URL')
@@ -48,7 +48,7 @@ def create_app():
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-    # Inicialização das extensões (igual a antes)
+    # Inicialização das extensões
     db.init_app(app)
     cache.init_app(app)
     cors.init_app(app)
@@ -60,12 +60,10 @@ def create_app():
             "SOLUSDT": "solana", "ADAUSDT": "cardano"
         }
 
-        # --- ✅ LÓGICA DE SINAL ATUALIZADA (A GRANDE MUDANÇA) ---
         def get_technical_signal(symbol):
             try:
                 coingecko_id = COINGECKO_MAP.get(symbol)
                 
-                # 1. ANÁLISE DIÁRIA (como antes)
                 logging.info(f"Buscando dados DIÁRIOS para {symbol}")
                 daily_url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
                 daily_response = requests.get(daily_url, timeout=15 )
@@ -89,9 +87,7 @@ def create_app():
 
                 last_daily, prev_daily = df_daily.iloc[-1], df_daily.iloc[-2]
                 
-                # 2. ANÁLISE SEMANAL (A NOVA CAMADA)
                 logging.info(f"Buscando dados SEMANAIS para {symbol}")
-                # Buscamos mais dias para garantir dados suficientes para a média semanal
                 weekly_url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
                 weekly_response = requests.get(weekly_url, timeout=15 )
                 weekly_response.raise_for_status()
@@ -99,30 +95,25 @@ def create_app():
                 
                 df_weekly = pd.DataFrame(weekly_data['prices'], columns=['timestamp', 'close'])
                 df_weekly['date'] = pd.to_datetime(df_weekly['timestamp'], unit='ms')
-                # 'W-SUN' agrupa os dados em semanas (terminando no Domingo)
                 df_weekly = df_weekly.resample('W-SUN', on='date').last()
                 
                 if df_weekly.empty: raise Exception("DataFrame semanal vazio.")
                 
-                # Média móvel de 10 semanas
                 df_weekly['SMA_10_weekly'] = df_weekly['close'].rolling(window=10).mean()
                 df_weekly.dropna(inplace=True)
                 if df_weekly.empty: raise Exception("Dados semanais insuficientes para SMA_10.")
                 
                 last_weekly = df_weekly.iloc[-1]
                 
-                # 3. COMBINAR AS ANÁLISES PARA GERAR O SINAL FINAL
                 signal_type = "HOLD"
                 confidence = ""
 
-                # Condições da análise diária (como antes)
                 daily_buy_condition = last_daily['SMA_10'] > last_daily['SMA_30'] and prev_daily['SMA_10'] <= prev_daily['SMA_30']
                 daily_sell_condition = last_daily['SMA_10'] < last_daily['SMA_30'] and prev_daily['SMA_10'] >= prev_daily['SMA_30']
                 rsi_check_buy = last_daily.get('RSI_14', 50) < 70
                 rsi_check_sell = last_daily.get('RSI_14', 50) > 30
                 volume_check = last_daily['volume'] > (last_daily['volume_sma_20'] * 1.20)
 
-                # Condições da análise semanal (o novo filtro)
                 weekly_trend_is_up = last_weekly['close'] > last_weekly['SMA_10_weekly']
                 
                 if daily_buy_condition and rsi_check_buy and volume_check:
@@ -133,8 +124,6 @@ def create_app():
                         logging.info(f"Sinal de compra para {symbol} ignorado. Tendência semanal de baixa.")
                 
                 elif daily_sell_condition and rsi_check_sell and volume_check:
-                    # Para vendas, a tendência semanal não é um filtro tão comum, mas podemos mantê-la por consistência
-                    # ou remover a condição 'and not weekly_trend_is_up' se quisermos vender mesmo em tendência de alta.
                     if not weekly_trend_is_up:
                         signal_type = "SELL"
                         confidence = " (Tendência Semanal OK)"
@@ -153,10 +142,26 @@ def create_app():
                 logging.error(f"Erro ao gerar sinal para {symbol}: {e}")
                 return {"pair": symbol.replace("USDT", "/USDT"), "signal": "ERROR", "error_message": str(e)}
 
-        # O resto das rotas e funções permanecem as mesmas
+        def salvar_sinal_no_historico(sinal_data):
+            try:
+                pair_name = sinal_data.get("pair")
+                if not pair_name or sinal_data.get("signal") == "ERROR": return
+                sinais_existentes = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
+                if len(sinais_existentes) >= 10: db.session.delete(sinais_existentes)
+                novo_sinal = SinalHistorico(
+                    pair=sinal_data['pair'], entry=sinal_data['entry'], signal=sinal_data['signal'],
+                    stop=sinal_data['stop'], target=sinal_data['target'], rsi=sinal_data['rsi']
+                )
+                db.session.add(novo_sinal)
+                db.session.commit()
+                logging.info(f"Novo sinal para {pair_name} salvo no histórico.")
+            except Exception as e:
+                logging.error(f"Falha ao salvar sinal no histórico para {pair_name}: {e}")
+                db.session.rollback()
+
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v4.0 (Weekly Trend Analysis)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v4.1 (Syntax Fix)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -168,10 +173,9 @@ def create_app():
                 signals.append(signal)
                 if signal.get("signal") != "ERROR":
                     salvar_sinal_no_historico(signal)
-                time.sleep(1.5) # Aumentamos um pouco o tempo para acomodar a chamada extra de API
+                time.sleep(1.5)
             return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
-        # ... (todas as outras rotas e funções como /history, setup, clear_cache, salvar_sinal)
         @app.route("/signals/history")
         def get_history():
             try:
@@ -205,23 +209,6 @@ def create_app():
                 logging.error(f"ERRO AO LIMPAR A CACHE: {e}")
                 return jsonify({"error": str(e)}), 500
 
-        def salvar_sinal_no_historico(sinal_data):
-            try:
-                pair_name = sinal_data.get("pair")
-                if not pair_name or sinal_data.get("signal") == "ERROR": return
-                sinais_existentes = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
-                if len(sinais_existentes) >= 10: db.session.delete(sinais_existentes[0])
-                novo_sinal = SinalHistorico(
-                    pair=sinal_data['pair'], entry=sinal_data['entry'], signal=sinal_data['signal'],
-                    stop=sinal_data['stop'], target=sinal_data['target'], rsi=sinal_data['rsi']
-                )
-                db.session.add(novo_sinal)
-                db.session.commit()
-                logging.info(f"Novo sinal para {pair_name} salvo no histórico.")
-            except Exception as e:
-                logging.error(f"Falha ao salvar sinal no histórico para {pair_name}: {e}")
-                db.session.rollback()
-
     return app
 
 app = create_app()
@@ -231,14 +218,4 @@ if __name__ == "__main__":
         db.create_all()
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando servidor na porta {port}")
-    app.run(debug=False, host='0.0.0.0', port=port)```
-
-### O que Fazer Agora
-
-1.  **Substitua o código** no seu `backend/main.py` no GitHub.
-2.  **Aguarde o deploy** na Railway. O seu backend irá reiniciar com a nova lógica.
-3.  **Execute a Sequência de Inicialização** para garantir que os novos sinais são gerados e salvos:
-    *   **Limpe a cache:** Aceda ao URL `.../admin/cache/clear-secret-path`
-    *   **Recarregue o frontend:** Vá ao seu site e faça um recarregamento forçado (Ctrl+Shift+R).
-
-Agora, os sinais de "BUY" só aparecerão se a tendência semanal também for de alta, tornando a nossa estratégia significativamente mais seletiva e, esperançosamente, mais lucrativa. Os sinais de "HOLD" serão ainda mais comuns, o que é um bom sinal de que a nossa estratégia está a ser paciente e a esperar pelas melhores oportunidades.
+    app.run(debug=False, host='0.0.0.0', port=port)
