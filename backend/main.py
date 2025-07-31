@@ -1,7 +1,7 @@
 import os
 import logging
 import time
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_caching import Cache
 from flask_sqlalchemy import SQLAlchemy
@@ -80,11 +80,9 @@ def create_app():
                 coingecko_id = COINGECKO_MAP.get(symbol)
                 
                 logging.info(f"Buscando dados de 365 dias para {symbol} (chamada única otimizada)")
-                # ✅ UMA ÚNICA CHAMADA PARA OBTER TODOS OS DADOS
                 url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
                 all_data = get_coingecko_data_with_retry(url )
 
-                # Processamento dos dados (como antes, mas agora a partir de uma única fonte)
                 df_full = pd.DataFrame(all_data['prices'], columns=['timestamp', 'close'])
                 df_full_volumes = pd.DataFrame(all_data['total_volumes'], columns=['timestamp', 'volume'])
                 df_full.set_index('timestamp', inplace=True)
@@ -92,7 +90,6 @@ def create_app():
                 df_full = df_full.join(df_full_volumes, how='inner').reset_index()
                 df_full['date'] = pd.to_datetime(df_full['timestamp'], unit='ms')
 
-                # 1. ANÁLISE DIÁRIA (usando os últimos 90 dias dos dados completos)
                 df_daily = df_full.tail(90).copy()
                 if df_daily.empty: raise Exception("DataFrame diário vazio.")
                 
@@ -105,7 +102,6 @@ def create_app():
                 if df_daily.empty: raise Exception("Dados diários insuficientes para análise.")
                 last_daily, prev_daily = df_daily.iloc[-1], df_daily.iloc[-2]
 
-                # 2. ANÁLISE SEMANAL (usando todos os 365 dias de dados)
                 df_weekly = df_full.resample('W-SUN', on='date').last()
                 if df_weekly.empty: raise Exception("DataFrame semanal vazio.")
                 df_weekly['SMA_10_weekly'] = df_weekly['close'].rolling(window=10).mean()
@@ -113,7 +109,6 @@ def create_app():
                 if df_weekly.empty: raise Exception("Dados semanais insuficientes para SMA_10.")
                 last_weekly = df_weekly.iloc[-1]
                 
-                # 3. LÓGICA DE SINAL (exatamente como antes)
                 signal_type = "HOLD"
                 confidence = ""
                 entry_price = float(last_daily['close'])
@@ -169,7 +164,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v6.0 (Robust & Optimized)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v7.0 (Visual Backtesting Ready)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -181,11 +176,9 @@ def create_app():
                 signals.append(signal)
                 if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
                     salvar_sinal_no_historico(signal)
-                # ✅ PAUSA FINAL E CONSERVADORA
-                time.sleep(5) 
+                time.sleep(5)
             return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
-        # O resto das rotas (/history, /setup, /admin) permanecem as mesmas
         @app.route("/signals/history")
         def get_history():
             try:
@@ -199,6 +192,47 @@ def create_app():
             except Exception as e:
                 logging.error(f"Erro ao buscar histórico da base de dados: {e}")
                 return jsonify({"error": "Não foi possível buscar o histórico."}), 500
+
+        # ✅ NOVO ENDPOINT PARA OS DADOS DO GRÁFICO
+        @app.route("/history/chart_data")
+        def get_chart_data():
+            pair_name = request.args.get('pair', type=str)
+            if not pair_name:
+                return jsonify({"error": "O parâmetro 'pair' é obrigatório."}), 400
+            
+            symbol = pair_name.replace("/", "")
+            coingecko_id = COINGECKO_MAP.get(symbol)
+            if not coingecko_id:
+                return jsonify({"error": "Par inválido."}), 400
+
+            try:
+                # 1. Buscar os dados de preço
+                logging.info(f"Buscando dados de preço para o gráfico de {pair_name}")
+                url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
+                price_data = get_coingecko_data_with_retry(url )
+                prices = price_data.get('prices', [])
+
+                # 2. Buscar os marcadores de sinais do nosso histórico
+                sinais_do_par = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
+                markers = []
+                for sinal in sinais_do_par:
+                    # Só adicionamos marcadores de Compra ou Venda
+                    if "BUY" in sinal.signal.upper() or "SELL" in sinal.signal.upper():
+                        markers.append({
+                            "timestamp": int(sinal.timestamp.timestamp() * 1000), # Converter para timestamp de milissegundos
+                            "price": sinal.entry,
+                            "type": "BUY" if "BUY" in sinal.signal.upper() else "SELL",
+                            "text": "C" if "BUY" in sinal.signal.upper() else "V" # Texto curto para o marcador
+                        })
+
+                return jsonify({
+                    "prices": prices,
+                    "markers": markers
+                })
+
+            except Exception as e:
+                logging.error(f"Erro ao buscar dados do gráfico para {pair_name}: {e}")
+                return jsonify({"error": "Não foi possível buscar os dados do gráfico."}), 500
 
         @app.route("/setup/database/create-tables-secret-path")
         def setup_database():
