@@ -164,7 +164,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v7.0 (Visual Backtesting Ready)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v7.1 (Timeout Fix)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -176,7 +176,7 @@ def create_app():
                 signals.append(signal)
                 if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
                     salvar_sinal_no_historico(signal)
-                time.sleep(5)
+                time.sleep(3) # Pausa otimizada
             return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
         @app.route("/signals/history")
@@ -193,7 +193,6 @@ def create_app():
                 logging.error(f"Erro ao buscar histórico da base de dados: {e}")
                 return jsonify({"error": "Não foi possível buscar o histórico."}), 500
 
-        # ✅ NOVO ENDPOINT PARA OS DADOS DO GRÁFICO
         @app.route("/history/chart_data")
         def get_chart_data():
             pair_name = request.args.get('pair', type=str)
@@ -206,23 +205,20 @@ def create_app():
                 return jsonify({"error": "Par inválido."}), 400
 
             try:
-                # 1. Buscar os dados de preço
                 logging.info(f"Buscando dados de preço para o gráfico de {pair_name}")
                 url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
                 price_data = get_coingecko_data_with_retry(url )
                 prices = price_data.get('prices', [])
 
-                # 2. Buscar os marcadores de sinais do nosso histórico
                 sinais_do_par = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
                 markers = []
                 for sinal in sinais_do_par:
-                    # Só adicionamos marcadores de Compra ou Venda
                     if "BUY" in sinal.signal.upper() or "SELL" in sinal.signal.upper():
                         markers.append({
-                            "timestamp": int(sinal.timestamp.timestamp() * 1000), # Converter para timestamp de milissegundos
+                            "timestamp": int(sinal.timestamp.timestamp() * 1000),
                             "price": sinal.entry,
                             "type": "BUY" if "BUY" in sinal.signal.upper() else "SELL",
-                            "text": "C" if "BUY" in sinal.signal.upper() else "V" # Texto curto para o marcador
+                            "text": "C" if "BUY" in sinal.signal.upper() else "V"
                         })
 
                 return jsonify({
