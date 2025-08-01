@@ -115,7 +115,7 @@ def create_app():
 
                 # --- LÓGICA DE SINAIS (ESTRATÉGIA DUPLA) ---
                 
-                # 1. Estratégia de Seguimento de Tendência (a nossa original)
+                # 1. Estratégia de Seguimento de Tendência
                 is_in_squeeze = last_daily.get('BBB_20_2.0', 1) < 0.1
                 if is_in_squeeze:
                     signal_type = "ALERTA"
@@ -135,12 +135,13 @@ def create_app():
                         signal_type = "SELL"
                         confidence = " (Cruzamento de Médias)"
 
-                # ✅ 2. Estratégia de Reversão à Média (se nenhum sinal de tendência foi encontrado)
+                # 2. Estratégia de Reversão à Média (se nenhum sinal de tendência foi encontrado)
                 if signal_type == "HOLD":
-                    # Condição de compra por reversão: Preço toca a banda inferior e RSI está sobrevendido
-                    reversion_buy_cond = last_daily.get('BBP_20_2.0', 0.5) < 0.05 and last_daily.get('RSI_14', 50) < 35
-                    # Condição de venda por reversão: Preço toca a banda superior e RSI está sobrecomprado
-                    reversion_sell_cond = last_daily.get('BBP_20_2.0', 0.5) > 0.95 and last_daily.get('RSI_14', 50) > 65
+                    # ✅ PARÂMETROS AJUSTADOS (MAIS SENSÍVEIS)
+                    # Condição de compra: Preço perto da banda inferior (20% em vez de 5%) e RSI abaixo de 40 (em vez de 35)
+                    reversion_buy_cond = last_daily.get('BBP_20_2.0', 0.5) < 0.20 and last_daily.get('RSI_14', 50) < 40
+                    # Condição de venda: Preço perto da banda superior (80% em vez de 95%) e RSI acima de 60 (em vez de 65)
+                    reversion_sell_cond = last_daily.get('BBP_20_2.0', 0.5) > 0.80 and last_daily.get('RSI_14', 50) > 60
 
                     if reversion_buy_cond:
                         signal_type = "BUY"
@@ -181,12 +182,12 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v8.0 (Dual Strategy)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v8.1 (Sensitive Reversion)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
         def get_signals():
-            logging.info("CACHE MISS: Gerando novos sinais (Estratégia Dupla) e salvando no histórico.")
+            logging.info("CACHE MISS: Gerando novos sinais (Estratégia Dupla Sensível) e salvando no histórico.")
             signals = []
             for symbol in COINGECKO_MAP.keys():
                 signal = get_technical_signal(symbol)
