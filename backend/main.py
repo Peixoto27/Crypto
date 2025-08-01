@@ -112,25 +112,42 @@ def create_app():
                 signal_type = "HOLD"
                 confidence = ""
                 entry_price = float(last_daily['close'])
+
+                # --- LÓGICA DE SINAIS (ESTRATÉGIA DUPLA) ---
+                
+                # 1. Estratégia de Seguimento de Tendência (a nossa original)
                 is_in_squeeze = last_daily.get('BBB_20_2.0', 1) < 0.1
                 if is_in_squeeze:
                     signal_type = "ALERTA"
                     confidence = " (Squeeze: Volatilidade Iminente)"
                 else:
-                    daily_buy_condition = last_daily['SMA_10'] > last_daily['SMA_30'] and prev_daily['SMA_10'] <= prev_daily['SMA_30']
-                    daily_sell_condition = last_daily['SMA_10'] < last_daily['SMA_30'] and prev_daily['SMA_10'] >= prev_daily['SMA_30']
+                    trend_buy_cond = last_daily['SMA_10'] > last_daily['SMA_30'] and prev_daily['SMA_10'] <= prev_daily['SMA_30']
+                    trend_sell_cond = last_daily['SMA_10'] < last_daily['SMA_30'] and prev_daily['SMA_10'] >= prev_daily['SMA_30']
                     rsi_check_buy = last_daily.get('RSI_14', 50) < 70
                     rsi_check_sell = last_daily.get('RSI_14', 50) > 30
                     volume_check = last_daily['volume'] > (last_daily['volume_sma_20'] * 1.20)
                     weekly_trend_is_up = last_weekly['close'] > last_weekly['SMA_10_weekly']
-                    price_not_overextended_buy = last_daily.get('BBP_20_2.0', 0.5) < 0.95
-                    price_not_overextended_sell = last_daily.get('BBP_20_2.0', 0.5) > 0.05
-                    if daily_buy_condition and rsi_check_buy and volume_check and weekly_trend_is_up and price_not_overextended_buy:
+                    
+                    if trend_buy_cond and rsi_check_buy and volume_check and weekly_trend_is_up:
                         signal_type = "BUY"
-                        confidence = " (Tendência Semanal OK)"
-                    elif daily_sell_condition and rsi_check_sell and volume_check and not weekly_trend_is_up and price_not_overextended_sell:
+                        confidence = " (Cruzamento de Médias)"
+                    elif trend_sell_cond and rsi_check_sell and volume_check and not weekly_trend_is_up:
                         signal_type = "SELL"
-                        confidence = " (Tendência Semanal OK)"
+                        confidence = " (Cruzamento de Médias)"
+
+                # ✅ 2. Estratégia de Reversão à Média (se nenhum sinal de tendência foi encontrado)
+                if signal_type == "HOLD":
+                    # Condição de compra por reversão: Preço toca a banda inferior e RSI está sobrevendido
+                    reversion_buy_cond = last_daily.get('BBP_20_2.0', 0.5) < 0.05 and last_daily.get('RSI_14', 50) < 35
+                    # Condição de venda por reversão: Preço toca a banda superior e RSI está sobrecomprado
+                    reversion_sell_cond = last_daily.get('BBP_20_2.0', 0.5) > 0.95 and last_daily.get('RSI_14', 50) > 65
+
+                    if reversion_buy_cond:
+                        signal_type = "BUY"
+                        confidence = " (Reversão à Média)"
+                    elif reversion_sell_cond:
+                        signal_type = "SELL"
+                        confidence = " (Reversão à Média)"
 
                 return {
                     "pair": symbol.replace("USDT", "/USDT"), "entry": round(entry_price, 4),
@@ -164,12 +181,12 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v7.1 (Timeout Fix)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v8.0 (Dual Strategy)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
         def get_signals():
-            logging.info("CACHE MISS: Gerando novos sinais (Otimizado) e salvando no histórico.")
+            logging.info("CACHE MISS: Gerando novos sinais (Estratégia Dupla) e salvando no histórico.")
             signals = []
             for symbol in COINGECKO_MAP.keys():
                 signal = get_technical_signal(symbol)
