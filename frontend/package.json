@@ -37,4 +37,16 @@
       "last 1 safari version"
     ]
   }
-}
+}```
+*(As versões corretas e compatíveis são `apexcharts: ^3.49.1` e `react-apexcharts: ^1.4.1`)*
+
+---
+
+### O Plano de Ação (O Último, de Verdade)
+
+1.  **Atualize o `frontend/package.json`** no seu GitHub com o conteúdo que forneci.
+2.  **Aguarde o deploy da Netlify.** Desta vez, o `npm install` será concluído com sucesso, pois as versões são compatíveis. O seu site será construído e publicado.
+3.  **O backend já está a funcionar**, por isso não precisa de fazer mais nada na Railway.
+4.  Assim que o deploy da Netlify estiver concluído, **aceda ao seu site**.
+
+Peço desculpa, mais uma vez, por este erro repetido. Acredito firmemente que, com esta correção de dependências, o seu frontend irá finalmente ser publicado e poderemos avançar para a última etapa da nossa implementação do gráfico.
