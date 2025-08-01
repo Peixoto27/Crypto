@@ -1,164 +1,162 @@
 import React, { useState, useEffect } from 'react';
-import ReactDOM from 'react-dom';
 import './App.css';
+import HistoryChart from './HistoryChart'; // ✅ Importa o novo componente
 
-// URL da nossa API na Railway
-const API_URL = 'https://reliable-mercy-production.up.railway.app';
+const API_BASE_URL = "https://reliable-mercy-production.up.railway.app";
 
-// --- COMPONENTE MODAL (POPUP ) ---
-const Modal = ({ isOpen, onClose, title, children }) => {
-  if (!isOpen) return null;
-
-  return ReactDOM.createPortal(
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" onClick={e => e.stopPropagation()}>
-        <div className="modal-header">
-          <h2 className="modal-title">{title}</h2>
-          <button className="close-button" onClick={onClose}>&times;</button>
-        </div>
+function Modal({ children, onClose } ) {
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-content">
+        <button onClick={onClose} className="modal-close-button">&times;</button>
         {children}
       </div>
-    </div>,
-    document.getElementById('modal-root')
+    </div>
   );
-};
+}
 
-// --- COMPONENTE PRINCIPAL DA APLICAÇÃO ---
 function App() {
   const [signals, setSignals] = useState([]);
-  const [history, setHistory] = useState({});
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  
+  const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [historyData, setHistoryData] = useState([]);
+  const [chartData, setChartData] = useState(null); // ✅ Estado para os dados do gráfico
   const [selectedPair, setSelectedPair] = useState(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
 
   useEffect(() => {
-    const fetchData = async () => {
+    const fetchSignals = async () => {
       try {
-        setLoading(true);
-        const [signalsResponse, historyResponse] = await Promise.all([
-          fetch(`${API_URL}/signals`),
-          fetch(`${API_URL}/signals/history`)
-        ]);
-
-        if (!signalsResponse.ok) throw new Error(`Erro ao buscar sinais: ${signalsResponse.statusText}`);
-        if (!historyResponse.ok) throw new Error(`Erro ao buscar histórico: ${historyResponse.statusText}`);
-
-        const signalsData = await signalsResponse.json();
-        const historyData = await historyResponse.json();
-
-        setSignals(signalsData.signals || []);
-        setHistory(historyData || {});
-        setError(null);
-      } catch (err) {
-        setError(err.message);
-        setSignals([]);
-        setHistory({});
+        const response = await fetch(`${API_BASE_URL}/signals`);
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const data = await response.json();
+        setSignals(data.signals || []);
+      } catch (e) {
+        setError(`Erro de Conexão: ${e.message}`);
       } finally {
         setLoading(false);
       }
     };
-
-    fetchData();
+    fetchSignals();
   }, []);
 
-  const openHistoryModal = (pair) => {
+  const handleOpenHistory = async (pair) => {
     setSelectedPair(pair);
     setIsModalOpen(true);
-  };
+    setLoadingHistory(true);
+    setHistoryData([]);
+    setChartData(null); // ✅ Limpa os dados do gráfico anterior
 
-  const closeHistoryModal = () => {
-    setIsModalOpen(false);
-    setSelectedPair(null);
-  };
+    try {
+      // Busca o histórico em tabela
+      const historyResponse = await fetch(`${API_BASE_URL}/signals/history`);
+      if (!historyResponse.ok) throw new Error('Falha ao buscar histórico em tabela');
+      const allHistory = await historyResponse.json();
+      setHistoryData(allHistory[pair] || []);
 
-  const getSignalClass = (signal) => {
-    if (signal.toLowerCase().includes('buy')) return 'buy';
-    if (signal.toLowerCase().includes('sell')) return 'sell';
-    if (signal.toLowerCase().includes('alerta')) return 'alert'; // ✅ NOVO: Classe para Alertas
-    if (signal.toLowerCase().includes('hold')) return 'hold';
-    return 'error';
+      // ✅ Busca os dados para o gráfico
+      const chartResponse = await fetch(`${API_BASE_URL}/history/chart_data?pair=${pair}`);
+      if (!chartResponse.ok) throw new Error('Falha ao buscar dados do gráfico');
+      const chartJson = await chartResponse.json();
+      setChartData(chartJson);
+
+    } catch (e) {
+      console.error("Erro ao buscar histórico:", e);
+      setError(`Erro ao buscar histórico: ${e.message}`);
+    } finally {
+      setLoadingHistory(false);
+    }
   };
 
   if (loading) {
-    return <div className="status-container"><h1>Carregando Sinais...</h1></div>;
+    return <div className="loading-container"><h1>Carregando Sinais...</h1></div>;
   }
 
-  if (error) {
-    return <div className="status-container"><div className="error-message"><h2>Erro de Conexão</h2><p>{error}</p></div></div>;
+  if (error && signals.length === 0) {
+    return <div className="error-container"><h2>{error}</h2></div>;
   }
 
   return (
     <div className="App">
-      <header className="app-header">
+      <header className="App-header">
         <h1>Crypton Signals</h1>
         <p>Análise técnica para os principais pares de criptomoedas.</p>
       </header>
-
-      <main>
-        <div className="signals-grid">
-          {signals.map((signal, index) => (
-            <div key={index} className="signal-card">
-              <h3 className="pair-name">{signal.pair}</h3>
-              
-              <div className={`signal-display ${getSignalClass(signal.signal)}`}>
-                {signal.signal}
-              </div>
-
-              <div className="signal-details">
-                <p><strong>Entrada:</strong> <span>${signal.entry?.toFixed(4)}</span></p>
-                <p><strong>Alvo:</strong> <span>${signal.target?.toFixed(4)}</span></p>
-                <p><strong>Stop:</strong> <span>${signal.stop?.toFixed(4)}</span></p>
-                <p><strong>RSI:</strong> <span>{signal.rsi?.toFixed(2)}</span></p>
-                {/* ✅ NOVO: Exibe os dados das Bandas de Bollinger se existirem */}
-                {signal.bb_upper > 0 && (
-                  <p className="bollinger-bands">
-                    <strong>BB:</strong> 
-                    <span>${signal.bb_lower?.toFixed(4)} - ${signal.bb_upper?.toFixed(4)}</span>
-                  </p>
-                )}
-              </div>
-
-              <button className="history-button" onClick={() => openHistoryModal(signal.pair)}>
-                Ver Histórico
-              </button>
+      <main className="signals-grid">
+        {signals.map((signal, index) => (
+          <div key={index} className="signal-card">
+            <h2>{signal.pair}</h2>
+            <div className={`signal-box ${signal.signal.includes('BUY') ? 'buy' : signal.signal.includes('SELL') ? 'sell' : signal.signal.includes('ALERTA') ? 'squeeze' : ''}`}>
+              {signal.signal}
             </div>
-          ))}
-        </div>
+            {signal.signal !== 'ERROR' ? (
+              <>
+                <p><strong>Entrada:</strong> $ {signal.entry}</p>
+                <p><strong>Alvo:</strong> $ {signal.target}</p>
+                <p><strong>Stop:</strong> $ {signal.stop}</p>
+                <p><strong>RSI:</strong> {signal.rsi}</p>
+                <p><strong>BB:</strong> ${signal.bb_lower} - ${signal.bb_upper}</p>
+              </>
+            ) : (
+              <div className="error-message-small">
+                <p>Não foi possível gerar o sinal.</p>
+                <p>Tente novamente mais tarde.</p>
+              </div>
+            )}
+            <button className="history-button" onClick={() => handleOpenHistory(signal.pair)}>
+              Ver Histórico
+            </button>
+          </div>
+        ))}
       </main>
 
-      <Modal isOpen={isModalOpen} onClose={closeHistoryModal} title={`Histórico para ${selectedPair}`}>
-        <table className="history-table">
-          <thead>
-            <tr>
-              <th>Data</th>
-              <th>Sinal</th>
-              <th>Entrada</th>
-              <th>Alvo</th>
-              <th>Stop</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(history[selectedPair] || []).map((record) => (
-              <tr key={record.id} className={`signal-row ${getSignalClass(record.signal)}-row`}>
-                <td>{record.timestamp}</td>
-                <td>
-                  <span className={`signal-cell ${getSignalClass(record.signal)}`}>
-                    {record.signal}
-                  </span>
-                </td>
-                <td>${record.entry.toFixed(4)}</td>
-                <td>${record.target.toFixed(4)}</td>
-                <td>${record.stop.toFixed(4)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {(!history[selectedPair] || history[selectedPair].length === 0) && (
-          <p style={{ textAlign: 'center', marginTop: '20px' }}>Nenhum histórico encontrado para este par.</p>
-        )}
-      </Modal>
+      {isModalOpen && (
+        <Modal onClose={() => setIsModalOpen(false)}>
+          <h2>Histórico para {selectedPair}</h2>
+          {loadingHistory ? (
+            <p>Carregando histórico...</p>
+          ) : (
+            <>
+              {/* ✅ Renderiza o gráfico se os dados existirem */}
+              {chartData && chartData.prices ? (
+                <HistoryChart data={chartData} />
+              ) : (
+                <p>Não foi possível carregar o gráfico.</p>
+              )}
+
+              {historyData.length > 0 ? (
+                <table className="history-table">
+                  <thead>
+                    <tr>
+                      <th>Data</th>
+                      <th>Sinal</th>
+                      <th>Entrada</th>
+                      <th>Alvo</th>
+                      <th>Stop</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {historyData.map((item, index) => (
+                      <tr key={index}>
+                        <td>{item.timestamp}</td>
+                        <td>{item.signal}</td>
+                        <td>$ {item.entry.toFixed(4)}</td>
+                        <td>$ {item.target.toFixed(4)}</td>
+                        <td>$ {item.stop.toFixed(4)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <p>Nenhum registro de histórico para este par.</p>
+              )}
+            </>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }
