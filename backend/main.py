@@ -169,7 +169,7 @@ def create_app():
 
     @app.route("/")
     def home():
-        return jsonify({"message": "Crypton Signals API v12.0 (Factory Pattern Fix)", "status": "online"})
+        return jsonify({"message": "Crypton Signals API v13.0 (Final Version)", "status": "online"})
 
     @app.route("/signals")
     @cache.cached()
@@ -238,12 +238,10 @@ def create_app():
 
     return app
 
-# ✅ CORREÇÃO: A chamada para create_app() foi removida do escopo global.
-# O Gunicorn agora será responsável por chamar a função.
+# ✅ CORREÇÃO FINAL: Esta linha cria a variável 'app' que o Gunicorn procura.
+app = create_app()
 
 if __name__ == "__main__":
-    # Esta parte só é executada quando você roda "python main.py" diretamente.
-    # O Gunicorn não executa este bloco.
-    app = create_app()
+    # Este bloco só é executado para desenvolvimento local (python main.py)
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
