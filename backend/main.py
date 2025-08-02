@@ -54,8 +54,6 @@ def create_app():
     db.init_app(app)
     cache.init_app(app)
     cors.init_app(app)
-
-    # ✅ CORREÇÃO: As rotas e funções devem ser definidas aqui, mas FORA do 'with app.app_context()'
     
     COINGECKO_MAP = {
         "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
@@ -152,7 +150,6 @@ def create_app():
             return {"pair": symbol.replace("USDT", "/USDT"), "signal": "ERROR", "error_message": str(e)}
 
     def salvar_sinal_no_historico(sinal_data):
-        # O app_context é necessário aqui, pois esta função é chamada de fora de uma rota.
         with app.app_context():
             try:
                 pair_name = sinal_data.get("pair")
@@ -172,7 +169,7 @@ def create_app():
 
     @app.route("/")
     def home():
-        return jsonify({"message": "Crypton Signals API v11.0 (Final Fix)", "status": "online"})
+        return jsonify({"message": "Crypton Signals API v12.0 (Factory Pattern Fix)", "status": "online"})
 
     @app.route("/signals")
     @cache.cached()
@@ -184,22 +181,18 @@ def create_app():
             signals.append(signal)
             if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
                 salvar_sinal_no_historico(signal)
-            time.sleep(2) # Pequena pausa para não sobrecarregar APIs
+            time.sleep(2)
         return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
     @app.route("/signals/history")
     def get_history():
-        try:
-            sinais = SinalHistorico.query.order_by(SinalHistorico.timestamp.desc()).all()
-            history_by_pair = {}
-            for sinal in sinais:
-                if sinal.pair not in history_by_pair:
-                    history_by_pair[sinal.pair] = []
-                history_by_pair[sinal.pair].append(sinal.to_dict())
-            return jsonify(history_by_pair)
-        except Exception as e:
-            logging.error(f"Erro ao buscar histórico da base de dados: {e}")
-            return jsonify({"error": "Não foi possível buscar o histórico."}), 500
+        sinais = SinalHistorico.query.order_by(SinalHistorico.timestamp.desc()).all()
+        history_by_pair = {}
+        for sinal in sinais:
+            if sinal.pair not in history_by_pair:
+                history_by_pair[sinal.pair] = []
+            history_by_pair[sinal.pair].append(sinal.to_dict())
+        return jsonify(history_by_pair)
 
     @app.route("/history/chart_data")
     def get_chart_data():
@@ -234,28 +227,23 @@ def create_app():
 
     @app.route("/setup/database/create-tables-secret-path")
     def setup_database():
-        try:
-            # O contexto é necessário aqui para operações de DB fora de uma requisição
-            with app.app_context():
-                db.create_all()
-            return jsonify({"message": "SUCESSO: As tabelas da base de dados foram criadas."}), 200
-        except Exception as e:
-            logging.error(f"ERRO AO CRIAR TABELAS: {e}")
-            return jsonify({"error": str(e)}), 500
+        with app.app_context():
+            db.create_all()
+        return jsonify({"message": "SUCESSO: As tabelas da base de dados foram criadas."}), 200
     
     @app.route("/admin/cache/clear-secret-path")
     def clear_cache():
-        try:
-            cache.clear()
-            return jsonify({"message": "SUCESSO: A cache foi limpa."}), 200
-        except Exception as e:
-            logging.error(f"ERRO AO LIMPAR A CACHE: {e}")
-            return jsonify({"error": str(e)}), 500
+        cache.clear()
+        return jsonify({"message": "SUCESSO: A cache foi limpa."}), 200
 
     return app
 
-app = create_app()
+# ✅ CORREÇÃO: A chamada para create_app() foi removida do escopo global.
+# O Gunicorn agora será responsável por chamar a função.
 
 if __name__ == "__main__":
+    # Esta parte só é executada quando você roda "python main.py" diretamente.
+    # O Gunicorn não executa este bloco.
+    app = create_app()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
