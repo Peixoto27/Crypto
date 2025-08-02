@@ -137,10 +137,7 @@ def create_app():
 
                 # 2. Estratégia de Reversão à Média (se nenhum sinal de tendência foi encontrado)
                 if signal_type == "HOLD":
-                    # ✅ PARÂMETROS AJUSTADOS (MAIS SENSÍVEIS)
-                    # Condição de compra: Preço perto da banda inferior (20% em vez de 5%) e RSI abaixo de 40 (em vez de 35)
                     reversion_buy_cond = last_daily.get('BBP_20_2.0', 0.5) < 0.20 and last_daily.get('RSI_14', 50) < 40
-                    # Condição de venda: Preço perto da banda superior (80% em vez de 95%) e RSI acima de 60 (em vez de 65)
                     reversion_sell_cond = last_daily.get('BBP_20_2.0', 0.5) > 0.80 and last_daily.get('RSI_14', 50) > 60
 
                     if reversion_buy_cond:
@@ -182,7 +179,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v8.1 (Sensitive Reversion)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v8.2 (Optimized Startup)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -272,8 +269,5 @@ def create_app():
 app = create_app()
 
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
     port = int(os.environ.get("PORT", 5000))
-    logging.info(f"Iniciando servidor na porta {port}")
-    app.run(debug=False, host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port)
