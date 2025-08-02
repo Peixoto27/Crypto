@@ -1,8 +1,10 @@
 Flask
-gunicorn
+Flask-Cors
+Flask-Caching
 requests
 pandas
-pandas_ta
-Flask-CORS
-Flask-Caching
+numpy
+pandas-ta
+gunicorn
 Flask-SQLAlchemy
+psycopg2-binary
