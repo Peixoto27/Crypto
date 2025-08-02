@@ -1,7 +1,7 @@
 import os
 from flask import Flask, jsonify
 
-# --- CÓDIGO MÍNIMO PARA TESTE COM MAIS LOGS --- 
+# --- CÓDIGO MÍNIMO CORRIGIDO PARA TESTE --- 
 
 print("DEBUG: main.py está a ser executado.")
 
@@ -25,12 +25,15 @@ def create_app():
     print("DEBUG: Aplicação Flask criada e rotas registadas.")
     return app
 
+# APLICAÇÃO É CRIADA DIRETAMENTE AQUI, FORA DO BLOCO if __name__ == "__main__":
 app = create_app()
 
-print("DEBUG: Variável 'app' definida.")
+print("DEBUG: Variável 'app' definida e pronta para Gunicorn.")
 
-if __name__ == "__main__":
-    print("DEBUG: Bloco __name__ == '__main__' está a ser executado.")
-    port = int(os.environ.get("PORT", 5000))
-    print(f"DEBUG: Iniciando servidor Flask localmente na porta {port}")
-    app.run(host='0.0.0.0', port=port)
+# O bloco if __name__ == "__main__": não é necessário para o Gunicorn
+# mas pode ser mantido para testes locais se desejar, mas sem o app.run()
+# if __name__ == "__main__":
+#    print("DEBUG: Bloco __name__ == '__main__' está a ser executado (apenas para testes locais).")
+#    port = int(os.environ.get("PORT", 5000))
+#    print(f"DEBUG: Iniciando servidor Flask localmente na porta {port}")
+#    app.run(host='0.0.0.0', port=port) # ESTA LINHA NÃO DEVE SER EXECUTADA PELO GUNICORN
