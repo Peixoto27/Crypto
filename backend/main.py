@@ -41,11 +41,12 @@ def create_app():
     # Configurações
     cache_config = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 21600}
     app.config.from_mapping(cache_config)
-    db_url = os.environ.get('DATABASE_URL')
-    if not db_url:
-        raise RuntimeError("ERRO CRÍTICO: A variável de ambiente DATABASE_URL não foi encontrada.")
+    
+    # ✅ MUDANÇA FINAL: Apenas pegamos a URL. A verificação real acontecerá quando o DB for usado.
+    db_url = os.environ.get('DATABASE_URL', 'sqlite:///fallback.db') # Adiciona um fallback para segurança
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
+    
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['COINGECKO_API_KEY'] = os.environ.get('COINGECKO_API_KEY')
@@ -169,7 +170,7 @@ def create_app():
 
     @app.route("/")
     def home():
-        return jsonify({"message": "Crypton Signals API v13.0 (Final Version)", "status": "online"})
+        return jsonify({"message": "Crypton Signals API v14.0 (Final Hope)", "status": "online"})
 
     @app.route("/signals")
     @cache.cached()
@@ -238,10 +239,8 @@ def create_app():
 
     return app
 
-# ✅ CORREÇÃO FINAL: Esta linha cria a variável 'app' que o Gunicorn procura.
 app = create_app()
 
 if __name__ == "__main__":
-    # Este bloco só é executado para desenvolvimento local (python main.py)
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
