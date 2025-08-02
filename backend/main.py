@@ -1,6 +1,7 @@
 import os
 import logging
-import time
+import time # Importado para o delay da API
+import traceback # Importado para logs de erro detalhados
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_caching import Cache
@@ -76,7 +77,7 @@ def create_app():
                 coingecko_id = COINGECKO_MAP.get(symbol)
                 logging.info(f"Buscando dados de 365 dias para {symbol} (com chave de API)")
                 url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
-                all_data = get_coingecko_data(url )
+                all_data = get_coingecko_data(url)
 
                 df_full = pd.DataFrame(all_data['prices'], columns=['timestamp', 'close'])
                 df_full_volumes = pd.DataFrame(all_data['total_volumes'], columns=['timestamp', 'volume'])
@@ -86,15 +87,23 @@ def create_app():
                 df_full['date'] = pd.to_datetime(df_full['timestamp'], unit='ms')
 
                 df_daily = df_full.tail(90).copy()
-                if df_daily.empty: raise Exception("DataFrame diário vazio.")
+                if df_daily.empty: raise Exception("DataFrame diário vazio mesmo antes dos cálculos.")
                 
                 df_daily.ta.rsi(length=14, append=True)
                 df_daily.ta.sma(close='close', length=10, append=True)
                 df_daily.ta.sma(close='close', length=30, append=True)
                 df_daily.ta.bbands(length=20, append=True)
                 df_daily['volume_sma_20'] = df_daily['volume'].rolling(window=20).mean()
+                
+                # ✅ MELHORIA: Log para diagnosticar o dropna()
+                logging.info(f"[{symbol}] Shape do df_daily ANTES de dropna: {df_daily.shape}")
                 df_daily.dropna(inplace=True)
-                if df_daily.empty: raise Exception("Dados diários insuficientes para análise.")
+                logging.info(f"[{symbol}] Shape do df_daily DEPOIS de dropna: {df_daily.shape}")
+
+                if df_daily.empty:
+                    # ✅ MELHORIA: Mensagem de erro mais clara
+                    raise Exception("Dados diários insuficientes para análise após dropna().")
+                
                 last_daily, prev_daily = df_daily.iloc[-1], df_daily.iloc[-2]
 
                 df_weekly = df_full.resample('W-SUN', on='date').last()
@@ -109,8 +118,6 @@ def create_app():
                 entry_price = float(last_daily['close'])
 
                 # --- LÓGICA DE SINAIS (ESTRATÉGIA DUPLA) ---
-                
-                # 1. Estratégia de Seguimento de Tendência
                 is_in_squeeze = last_daily.get('BBB_20_2.0', 1) < 0.1
                 if is_in_squeeze:
                     signal_type = "ALERTA"
@@ -130,7 +137,6 @@ def create_app():
                         signal_type = "SELL"
                         confidence = " (Cruzamento de Médias)"
 
-                # 2. Estratégia de Reversão à Média (se nenhum sinal de tendência foi encontrado)
                 if signal_type == "HOLD":
                     reversion_buy_cond = last_daily.get('BBP_20_2.0', 0.5) < 0.20 and last_daily.get('RSI_14', 50) < 40
                     reversion_sell_cond = last_daily.get('BBP_20_2.0', 0.5) > 0.80 and last_daily.get('RSI_14', 50) > 60
@@ -152,7 +158,9 @@ def create_app():
                 }
 
             except Exception as e:
-                logging.error(f"Erro ao gerar sinal para {symbol}: {e}")
+                # ✅ MELHORIA: Log de erro com traceback completo para diagnóstico preciso
+                tb_str = traceback.format_exc()
+                logging.error(f"Erro ao gerar sinal para {symbol}: {e}\nTraceback:\n{tb_str}")
                 return {"pair": symbol.replace("USDT", "/USDT"), "signal": "ERROR", "error_message": str(e)}
 
         def salvar_sinal_no_historico(sinal_data):
@@ -174,7 +182,7 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v10.0 (API Key Fix)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v10.1 (Debugging Enhanced)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
@@ -186,6 +194,10 @@ def create_app():
                 signals.append(signal)
                 if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
                     salvar_sinal_no_historico(signal)
+                
+                # ✅ MELHORIA: Pausa para evitar o limite de requisições da API da CoinGecko
+                time.sleep(5) 
+            
             return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
         @app.route("/signals/history")
@@ -216,8 +228,7 @@ def create_app():
             try:
                 logging.info(f"Buscando dados de preço para o gráfico de {pair_name} (com chave de API)")
                 url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
-                # ✅ CORREÇÃO: USAR A FUNÇÃO get_coingecko_data QUE JÁ TEM A CHAVE
-                price_data = get_coingecko_data(url )
+                price_data = get_coingecko_data(url)
                 prices = price_data.get('prices', [])
 
                 sinais_do_par = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
@@ -266,3 +277,4 @@ app = create_app()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+    
