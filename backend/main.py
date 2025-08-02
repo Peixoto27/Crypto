@@ -268,6 +268,15 @@ def create_app():
 
 app = create_app()
 
+# ✅ CÓDIGO REMOVIDO DAQUI
+# if __name__ == "__main__":
+#     with app.app_context():
+#         db.create_all()
+#     port = int(os.environ.get("PORT", 5000))
+#     logging.info(f"Iniciando servidor na porta {port}")
+#     app.run(debug=False, host='0.0.0.0', port=port)
+
+# ✅ E ADICIONADO AQUI, DE FORMA MAIS SIMPLES
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
