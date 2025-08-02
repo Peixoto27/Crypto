@@ -1,7 +1,6 @@
 import os
 import logging
 import time
-import traceback
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_caching import Cache
@@ -43,116 +42,127 @@ def create_app():
     app.config.from_mapping(cache_config)
     db_url = os.environ.get('DATABASE_URL')
     if not db_url:
-        # Esta verificação é boa, mas a mantemos simples por enquanto.
-        # Se o app falhar, será por causa da conexão, o que é um bom indicador.
-        logging.warning("DATABASE_URL não encontrada, a aplicação pode falhar ao acessar o DB.")
-    if db_url and db_url.startswith("postgres://"):
+        raise RuntimeError("ERRO CRÍTICO: A variável de ambiente DATABASE_URL não foi encontrada.")
+    if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    app.config['COINGECKO_API_KEY'] = os.environ.get('COINGECKO_API_KEY')
 
     # Inicialização das extensões
     db.init_app(app)
     cache.init_app(app)
     cors.init_app(app)
-    
-    COINGECKO_MAP = {
-        "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
-        "SOLUSDT": "solana", "ADAUSDT": "cardano"
-    }
 
-    def get_coingecko_data(url):
-        headers = {}
-        api_key = app.config.get('COINGECKO_API_KEY')
-        if api_key:
-            headers['x-cg-demo-api-key'] = api_key
-        
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
-        return response.json()
+    # --- CONTEXTO DA APLICAÇÃO E ROTAS ---
+    with app.app_context():
+        COINGECKO_MAP = {
+            "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
+            "SOLUSDT": "solana", "ADAUSDT": "cardano"
+        }
 
-    def get_technical_signal(symbol):
-        try:
-            coingecko_id = COINGECKO_MAP.get(symbol)
-            logging.info(f"Buscando dados de 365 dias para {symbol}")
-            url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
-            all_data = get_coingecko_data(url)
+        def get_coingecko_data_with_retry(url, retries=3, backoff_factor=3):
+            for i in range(retries):
+                try:
+                    response = requests.get(url, timeout=20)
+                    response.raise_for_status()
+                    return response.json()
+                except requests.exceptions.HTTPError as e:
+                    if e.response.status_code == 429:
+                        wait_time = backoff_factor * (2 ** i)
+                        logging.warning(f"Erro 429 - Too Many Requests. Tentando novamente em {wait_time} segundos...")
+                        time.sleep(wait_time)
+                    else:
+                        raise e
+            raise Exception(f"Falha ao buscar dados após {retries} tentativas.")
 
-            df_full = pd.DataFrame(all_data['prices'], columns=['timestamp', 'close'])
-            df_full_volumes = pd.DataFrame(all_data['total_volumes'], columns=['timestamp', 'volume'])
-            df_full.set_index('timestamp', inplace=True)
-            df_full_volumes.set_index('timestamp', inplace=True)
-            df_full = df_full.join(df_full_volumes, how='inner').reset_index()
-            df_full['date'] = pd.to_datetime(df_full['timestamp'], unit='ms')
-
-            df_daily = df_full.tail(90).copy()
-            if df_daily.empty: raise Exception("DataFrame diário vazio.")
-            
-            df_daily.ta.rsi(length=14, append=True)
-            df_daily.ta.sma(close='close', length=10, append=True)
-            df_daily.ta.sma(close='close', length=30, append=True)
-            df_daily.ta.bbands(length=20, append=True)
-            df_daily['volume_sma_20'] = df_daily['volume'].rolling(window=20).mean()
-            df_daily.dropna(inplace=True)
-            if df_daily.empty: raise Exception("Dados diários insuficientes para análise.")
-            last_daily, prev_daily = df_daily.iloc[-1], df_daily.iloc[-2]
-
-            df_weekly = df_full.resample('W-SUN', on='date').last()
-            if df_weekly.empty: raise Exception("DataFrame semanal vazio.")
-            df_weekly['SMA_10_weekly'] = df_weekly['close'].rolling(window=10).mean()
-            df_weekly.dropna(inplace=True)
-            if df_weekly.empty: raise Exception("Dados semanais insuficientes para SMA_10.")
-            last_weekly = df_weekly.iloc[-1]
-            
-            signal_type = "HOLD"
-            confidence = ""
-            entry_price = float(last_daily['close'])
-
-            is_in_squeeze = last_daily.get('BBB_20_2.0', 1) < 0.1
-            if is_in_squeeze:
-                signal_type = "ALERTA"
-                confidence = " (Squeeze: Volatilidade Iminente)"
-            else:
-                trend_buy_cond = last_daily['SMA_10'] > last_daily['SMA_30'] and prev_daily['SMA_10'] <= prev_daily['SMA_30']
-                trend_sell_cond = last_daily['SMA_10'] < last_daily['SMA_30'] and prev_daily['SMA_10'] >= prev_daily['SMA_30']
-                rsi_check_buy = last_daily.get('RSI_14', 50) < 70
-                rsi_check_sell = last_daily.get('RSI_14', 50) > 30
-                volume_check = last_daily['volume'] > (last_daily['volume_sma_20'] * 1.20)
-                weekly_trend_is_up = last_weekly['close'] > last_weekly['SMA_10_weekly']
+        def get_technical_signal(symbol):
+            try:
+                coingecko_id = COINGECKO_MAP.get(symbol)
                 
-                if trend_buy_cond and rsi_check_buy and volume_check and weekly_trend_is_up:
-                    signal_type = "BUY"
-                    confidence = " (Cruzamento de Médias)"
-                elif trend_sell_cond and rsi_check_sell and volume_check and not weekly_trend_is_up:
-                    signal_type = "SELL"
-                    confidence = " (Cruzamento de Médias)"
+                logging.info(f"Buscando dados de 365 dias para {symbol} (chamada única otimizada)")
+                url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
+                all_data = get_coingecko_data_with_retry(url )
 
-            if signal_type == "HOLD":
-                reversion_buy_cond = last_daily.get('BBP_20_2.0', 0.5) < 0.20 and last_daily.get('RSI_14', 50) < 40
-                reversion_sell_cond = last_daily.get('BBP_20_2.0', 0.5) > 0.80 and last_daily.get('RSI_14', 50) > 60
+                df_full = pd.DataFrame(all_data['prices'], columns=['timestamp', 'close'])
+                df_full_volumes = pd.DataFrame(all_data['total_volumes'], columns=['timestamp', 'volume'])
+                df_full.set_index('timestamp', inplace=True)
+                df_full_volumes.set_index('timestamp', inplace=True)
+                df_full = df_full.join(df_full_volumes, how='inner').reset_index()
+                df_full['date'] = pd.to_datetime(df_full['timestamp'], unit='ms')
 
-                if reversion_buy_cond:
-                    signal_type = "BUY"
-                    confidence = " (Reversão à Média)"
-                elif reversion_sell_cond:
-                    signal_type = "SELL"
-                    confidence = " (Reversão à Média)"
+                df_daily = df_full.tail(90).copy()
+                if df_daily.empty: raise Exception("DataFrame diário vazio.")
+                
+                df_daily.ta.rsi(length=14, append=True)
+                df_daily.ta.sma(close='close', length=10, append=True)
+                df_daily.ta.sma(close='close', length=30, append=True)
+                df_daily.ta.bbands(length=20, append=True)
+                df_daily['volume_sma_20'] = df_daily['volume'].rolling(window=20).mean()
+                df_daily.dropna(inplace=True)
+                if df_daily.empty: raise Exception("Dados diários insuficientes para análise.")
+                last_daily, prev_daily = df_daily.iloc[-1], df_daily.iloc[-2]
 
-            return {
-                "pair": symbol.replace("USDT", "/USDT"), "entry": round(entry_price, 4),
-                "signal": f"{signal_type}{confidence}", "stop": round(entry_price * 0.98, 4),
-                "target": round(entry_price * 1.03, 4), "rsi": round(last_daily.get('RSI_14', 50), 2),
-                "timestamp": datetime.now().isoformat()
-            }
+                df_weekly = df_full.resample('W-SUN', on='date').last()
+                if df_weekly.empty: raise Exception("DataFrame semanal vazio.")
+                df_weekly['SMA_10_weekly'] = df_weekly['close'].rolling(window=10).mean()
+                df_weekly.dropna(inplace=True)
+                if df_weekly.empty: raise Exception("Dados semanais insuficientes para SMA_10.")
+                last_weekly = df_weekly.iloc[-1]
+                
+                signal_type = "HOLD"
+                confidence = ""
+                entry_price = float(last_daily['close'])
 
-        except Exception as e:
-            tb_str = traceback.format_exc()
-            logging.error(f"Erro ao gerar sinal para {symbol}: {e}\nTraceback:\n{tb_str}")
-            return {"pair": symbol.replace("USDT", "/USDT"), "signal": "ERROR", "error_message": str(e)}
+                # --- LÓGICA DE SINAIS (ESTRATÉGIA DUPLA) ---
+                
+                # 1. Estratégia de Seguimento de Tendência (a nossa original)
+                is_in_squeeze = last_daily.get('BBB_20_2.0', 1) < 0.1
+                if is_in_squeeze:
+                    signal_type = "ALERTA"
+                    confidence = " (Squeeze: Volatilidade Iminente)"
+                else:
+                    trend_buy_cond = last_daily['SMA_10'] > last_daily['SMA_30'] and prev_daily['SMA_10'] <= prev_daily['SMA_30']
+                    trend_sell_cond = last_daily['SMA_10'] < last_daily['SMA_30'] and prev_daily['SMA_10'] >= prev_daily['SMA_30']
+                    rsi_check_buy = last_daily.get('RSI_14', 50) < 70
+                    rsi_check_sell = last_daily.get('RSI_14', 50) > 30
+                    volume_check = last_daily['volume'] > (last_daily['volume_sma_20'] * 1.20)
+                    weekly_trend_is_up = last_weekly['close'] > last_weekly['SMA_10_weekly']
+                    
+                    if trend_buy_cond and rsi_check_buy and volume_check and weekly_trend_is_up:
+                        signal_type = "BUY"
+                        confidence = " (Cruzamento de Médias)"
+                    elif trend_sell_cond and rsi_check_sell and volume_check and not weekly_trend_is_up:
+                        signal_type = "SELL"
+                        confidence = " (Cruzamento de Médias)"
 
-    def salvar_sinal_no_historico(sinal_data):
-        with app.app_context():
+                # ✅ 2. Estratégia de Reversão à Média (se nenhum sinal de tendência foi encontrado)
+                if signal_type == "HOLD":
+                    # Condição de compra por reversão: Preço toca a banda inferior e RSI está sobrevendido
+                    reversion_buy_cond = last_daily.get('BBP_20_2.0', 0.5) < 0.05 and last_daily.get('RSI_14', 50) < 35
+                    # Condição de venda por reversão: Preço toca a banda superior e RSI está sobrecomprado
+                    reversion_sell_cond = last_daily.get('BBP_20_2.0', 0.5) > 0.95 and last_daily.get('RSI_14', 50) > 65
+
+                    if reversion_buy_cond:
+                        signal_type = "BUY"
+                        confidence = " (Reversão à Média)"
+                    elif reversion_sell_cond:
+                        signal_type = "SELL"
+                        confidence = " (Reversão à Média)"
+
+                return {
+                    "pair": symbol.replace("USDT", "/USDT"), "entry": round(entry_price, 4),
+                    "signal": f"{signal_type}{confidence}", "stop": round(entry_price * 0.98, 4),
+                    "target": round(entry_price * 1.03, 4), "rsi": round(last_daily.get('RSI_14', 50), 2),
+                    "bb_upper": round(last_daily.get('BBU_20_2.0', 0), 4),
+                    "bb_lower": round(last_daily.get('BBL_20_2.0', 0), 4),
+                    "timestamp": datetime.now().isoformat()
+                }
+
+            except Exception as e:
+                logging.error(f"Erro ao gerar sinal para {symbol}: {e}")
+                return {"pair": symbol.replace("USDT", "/USDT"), "signal": "ERROR", "error_message": str(e)}
+
+        def salvar_sinal_no_historico(sinal_data):
             try:
                 pair_name = sinal_data.get("pair")
                 if not pair_name or sinal_data.get("signal") == "ERROR": return
@@ -169,79 +179,100 @@ def create_app():
                 logging.error(f"Falha ao salvar sinal no histórico para {pair_name}: {e}")
                 db.session.rollback()
 
-    @app.route("/")
-    def home():
-        return jsonify({"message": "Crypton Signals API v15.0 (IT WORKS!)", "status": "online"})
+        @app.route("/")
+        def home():
+            return jsonify({"message": "Crypton Signals API v8.0 (Dual Strategy)", "status": "online"})
 
-    @app.route("/signals")
-    @cache.cached()
-    def get_signals():
-        logging.info("CACHE MISS: Gerando novos sinais e salvando no histórico.")
-        signals = []
-        for symbol in COINGECKO_MAP.keys():
-            signal = get_technical_signal(symbol)
-            signals.append(signal)
-            if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
-                salvar_sinal_no_historico(signal)
-            time.sleep(2)
-        return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
+        @app.route("/signals")
+        @cache.cached()
+        def get_signals():
+            logging.info("CACHE MISS: Gerando novos sinais (Estratégia Dupla) e salvando no histórico.")
+            signals = []
+            for symbol in COINGECKO_MAP.keys():
+                signal = get_technical_signal(symbol)
+                signals.append(signal)
+                if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
+                    salvar_sinal_no_historico(signal)
+                time.sleep(3) # Pausa otimizada
+            return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
-    @app.route("/signals/history")
-    def get_history():
-        sinais = SinalHistorico.query.order_by(SinalHistorico.timestamp.desc()).all()
-        history_by_pair = {}
-        for sinal in sinais:
-            if sinal.pair not in history_by_pair:
-                history_by_pair[sinal.pair] = []
-            history_by_pair[sinal.pair].append(sinal.to_dict())
-        return jsonify(history_by_pair)
+        @app.route("/signals/history")
+        def get_history():
+            try:
+                sinais = SinalHistorico.query.order_by(SinalHistorico.timestamp.desc()).all()
+                history_by_pair = {}
+                for sinal in sinais:
+                    if sinal.pair not in history_by_pair:
+                        history_by_pair[sinal.pair] = []
+                    history_by_pair[sinal.pair].append(sinal.to_dict())
+                return jsonify(history_by_pair)
+            except Exception as e:
+                logging.error(f"Erro ao buscar histórico da base de dados: {e}")
+                return jsonify({"error": "Não foi possível buscar o histórico."}), 500
 
-    @app.route("/history/chart_data")
-    def get_chart_data():
-        pair_name = request.args.get('pair', type=str)
-        if not pair_name: return jsonify({"error": "O parâmetro 'pair' é obrigatório."}), 400
+        @app.route("/history/chart_data")
+        def get_chart_data():
+            pair_name = request.args.get('pair', type=str)
+            if not pair_name:
+                return jsonify({"error": "O parâmetro 'pair' é obrigatório."}), 400
+            
+            symbol = pair_name.replace("/", "")
+            coingecko_id = COINGECKO_MAP.get(symbol)
+            if not coingecko_id:
+                return jsonify({"error": "Par inválido."}), 400
+
+            try:
+                logging.info(f"Buscando dados de preço para o gráfico de {pair_name}")
+                url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
+                price_data = get_coingecko_data_with_retry(url )
+                prices = price_data.get('prices', [])
+
+                sinais_do_par = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
+                markers = []
+                for sinal in sinais_do_par:
+                    if "BUY" in sinal.signal.upper() or "SELL" in sinal.signal.upper():
+                        markers.append({
+                            "timestamp": int(sinal.timestamp.timestamp() * 1000),
+                            "price": sinal.entry,
+                            "type": "BUY" if "BUY" in sinal.signal.upper() else "SELL",
+                            "text": "C" if "BUY" in sinal.signal.upper() else "V"
+                        })
+
+                return jsonify({
+                    "prices": prices,
+                    "markers": markers
+                })
+
+            except Exception as e:
+                logging.error(f"Erro ao buscar dados do gráfico para {pair_name}: {e}")
+                return jsonify({"error": "Não foi possível buscar os dados do gráfico."}), 500
+
+        @app.route("/setup/database/create-tables-secret-path")
+        def setup_database():
+            try:
+                with app.app_context():
+                    db.create_all()
+                return jsonify({"message": "SUCESSO: As tabelas da base de dados foram criadas (ou já existiam)."}), 200
+            except Exception as e:
+                logging.error(f"ERRO AO CRIAR TABELAS: {e}")
+                return jsonify({"error": str(e)}), 500
         
-        symbol = pair_name.replace("/", "")
-        coingecko_id = COINGECKO_MAP.get(symbol)
-        if not coingecko_id: return jsonify({"error": "Par inválido."}), 400
-
-        try:
-            url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
-            price_data = get_coingecko_data(url)
-            prices = price_data.get('prices', [])
-
-            sinais_do_par = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
-            markers = []
-            for sinal in sinais_do_par:
-                if "BUY" in sinal.signal.upper() or "SELL" in sinal.signal.upper():
-                    markers.append({
-                        "timestamp": int(sinal.timestamp.timestamp() * 1000),
-                        "price": sinal.entry,
-                        "type": "BUY" if "BUY" in sinal.signal.upper() else "SELL",
-                        "text": "C" if "BUY" in sinal.signal.upper() else "V"
-                    })
-
-            return jsonify({"prices": prices, "markers": markers})
-
-        except Exception as e:
-            logging.error(f"Erro ao buscar dados do gráfico para {pair_name}: {e}")
-            return jsonify({"error": "Não foi possível buscar os dados do gráfico."}), 500
-
-    @app.route("/setup/database/create-tables-secret-path")
-    def setup_database():
-        with app.app_context():
-            db.create_all()
-        return jsonify({"message": "SUCESSO: As tabelas da base de dados foram criadas."}), 200
-    
-    @app.route("/admin/cache/clear-secret-path")
-    def clear_cache():
-        cache.clear()
-        return jsonify({"message": "SUCESSO: A cache foi limpa."}), 200
+        @app.route("/admin/cache/clear-secret-path")
+        def clear_cache():
+            try:
+                cache.clear()
+                return jsonify({"message": "SUCESSO: A cache foi limpa."}), 200
+            except Exception as e:
+                logging.error(f"ERRO AO LIMPAR A CACHE: {e}")
+                return jsonify({"error": str(e)}), 500
 
     return app
 
 app = create_app()
 
 if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    logging.info(f"Iniciando servidor na porta {port}")
+    app.run(debug=False, host='0.0.0.0', port=port)
