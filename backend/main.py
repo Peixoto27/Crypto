@@ -47,6 +47,7 @@ def create_app():
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config['COINGECKO_API_KEY'] = os.environ.get('COINGECKO_API_KEY')
 
     # Inicialização das extensões
     db.init_app(app)
@@ -60,28 +61,22 @@ def create_app():
             "SOLUSDT": "solana", "ADAUSDT": "cardano"
         }
 
-        def get_coingecko_data_with_retry(url, retries=3, backoff_factor=3):
-            for i in range(retries):
-                try:
-                    response = requests.get(url, timeout=20)
-                    response.raise_for_status()
-                    return response.json()
-                except requests.exceptions.HTTPError as e:
-                    if e.response.status_code == 429:
-                        wait_time = backoff_factor * (2 ** i)
-                        logging.warning(f"Erro 429 - Too Many Requests. Tentando novamente em {wait_time} segundos...")
-                        time.sleep(wait_time)
-                    else:
-                        raise e
-            raise Exception(f"Falha ao buscar dados após {retries} tentativas.")
+        def get_coingecko_data(url):
+            headers = {}
+            api_key = app.config.get('COINGECKO_API_KEY')
+            if api_key:
+                headers['x-cg-demo-api-key'] = api_key
+            
+            response = requests.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            return response.json()
 
         def get_technical_signal(symbol):
             try:
                 coingecko_id = COINGECKO_MAP.get(symbol)
-                
-                logging.info(f"Buscando dados de 365 dias para {symbol} (chamada única otimizada)")
+                logging.info(f"Buscando dados de 365 dias para {symbol} (com chave de API)")
                 url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
-                all_data = get_coingecko_data_with_retry(url )
+                all_data = get_coingecko_data(url )
 
                 df_full = pd.DataFrame(all_data['prices'], columns=['timestamp', 'close'])
                 df_full_volumes = pd.DataFrame(all_data['total_volumes'], columns=['timestamp', 'volume'])
@@ -179,19 +174,18 @@ def create_app():
 
         @app.route("/")
         def home():
-            return jsonify({"message": "Crypton Signals API v8.2 (Optimized Startup)", "status": "online"})
+            return jsonify({"message": "Crypton Signals API v10.0 (API Key Fix)", "status": "online"})
 
         @app.route("/signals")
         @cache.cached()
         def get_signals():
-            logging.info("CACHE MISS: Gerando novos sinais (Estratégia Dupla Sensível) e salvando no histórico.")
+            logging.info("CACHE MISS: Gerando novos sinais (com chave de API) e salvando no histórico.")
             signals = []
             for symbol in COINGECKO_MAP.keys():
                 signal = get_technical_signal(symbol)
                 signals.append(signal)
                 if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
                     salvar_sinal_no_historico(signal)
-                time.sleep(3) # Pausa otimizada
             return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
 
         @app.route("/signals/history")
@@ -220,9 +214,10 @@ def create_app():
                 return jsonify({"error": "Par inválido."}), 400
 
             try:
-                logging.info(f"Buscando dados de preço para o gráfico de {pair_name}")
+                logging.info(f"Buscando dados de preço para o gráfico de {pair_name} (com chave de API)")
                 url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
-                price_data = get_coingecko_data_with_retry(url )
+                # ✅ CORREÇÃO: USAR A FUNÇÃO get_coingecko_data QUE JÁ TEM A CHAVE
+                price_data = get_coingecko_data(url )
                 prices = price_data.get('prices', [])
 
                 sinais_do_par = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
