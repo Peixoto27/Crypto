@@ -1,2 +1,8 @@
 Flask
 gunicorn
+requests
+pandas
+pandas_ta
+Flask-CORS
+Flask-Caching
+Flask-SQLAlchemy
