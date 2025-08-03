@@ -131,7 +131,6 @@ function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalContent, setModalContent] = useState({ pair: '', history: [], chartData: null });
 
-  // ✅ CORREÇÃO APLICADA AQUI!
   const API_URL = 'https://kind-perfection-production-6085.up.railway.app';
 
   useEffect(( ) => {
@@ -159,19 +158,26 @@ function App() {
       const historyResponse = await fetch(`${API_URL}/signals/history`);
       if (!historyResponse.ok) throw new Error('Falha ao buscar histórico da tabela.');
       const historyData = await historyResponse.json();
-      const pairHistory = historyData[pair] || [];
+      const pairHistoryAll = historyData[pair] || [];
+
+      // ✅ MELHORIA APLICADA AQUI!
+      // Filtra o histórico para incluir apenas sinais de BUY ou SELL.
+      const filteredHistory = pairHistoryAll.filter(item => 
+        item.signal.toUpperCase().includes('BUY') || item.signal.toUpperCase().includes('SELL')
+      );
 
       // Busca os dados para o gráfico
       const chartResponse = await fetch(`${API_URL}/history/chart_data?pair=${pair}`);
       if (!chartResponse.ok) throw new Error('Falha ao buscar dados do gráfico.');
       const chartData = await chartResponse.json();
 
-      setModalContent({ pair, history: pairHistory, chartData });
+      // Passa o histórico JÁ FILTRADO para o modal.
+      setModalContent({ pair, history: filteredHistory, chartData });
       setIsModalOpen(true);
     } catch (e) {
       console.error("Erro ao buscar histórico:", e);
       // Exibe o modal mesmo com erro no gráfico, para mostrar a tabela
-      setModalContent(prevState => ({ ...prevState, pair, chartData: null }));
+      setModalContent(prevState => ({ ...prevState, pair, history: [], chartData: null }));
       setIsModalOpen(true);
     }
   };
@@ -222,7 +228,7 @@ function App() {
                 ))
               ) : (
                 <tr>
-                  <td colSpan="5">Nenhum histórico disponível para este par.</td>
+                  <td colSpan="5">Nenhum sinal de Compra ou Venda no histórico recente.</td>
                 </tr>
               )}
             </tbody>
