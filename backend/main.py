@@ -12,10 +12,9 @@ import pandas_ta as ta
 from datetime import datetime
 
 # --- INICIALIZAÇÃO DAS EXTENSÕES ---
-# Deixamos as extensões aqui fora para serem importadas por outros módulos se necessário
 db = SQLAlchemy()
 cache = Cache()
-cors = CORS()
+# O CORS será inicializado dentro da função create_app
 
 # --- MODELO DA BASE DE DADOS ---
 class SinalHistorico(db.Model):
@@ -37,30 +36,31 @@ class SinalHistorico(db.Model):
 # --- FÁBRICA DE APLICAÇÃO (APPLICATION FACTORY) ---
 def create_app():
     app = Flask(__name__)
-    # Configura o logging o mais cedo possível
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     # --- CONFIGURAÇÕES ---
     app.config["CACHE_TYPE"] = "SimpleCache"
     app.config["CACHE_DEFAULT_TIMEOUT"] = 21600
 
-    # Configuração do Banco de Dados (agora reativada e segura)
     db_url = os.environ.get('DATABASE_URL')
     if not db_url:
-        # Isso vai derrubar a aplicação se a variável não estiver no Railway, o que é bom.
         raise RuntimeError("ERRO CRÍTICO: A variável de ambiente DATABASE_URL não foi encontrada.")
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     
-    # Configuração da API Key
     app.config['COINGECKO_API_KEY'] = os.environ.get('COINGECKO_API_KEY')
 
     # --- INICIALIZAÇÃO DAS EXTENSÕES COM A APLICAÇÃO ---
     db.init_app(app)
     cache.init_app(app)
-    cors.init_app(app, resources={r"/*": {"origins": "*"}}) # Permite todas as origens
+    
+    # ✅ ATUALIZAÇÃO DO CORS AQUI!
+    # Permite requisições especificamente do seu frontend no Netlify.
+    CORS(app, resources={
+        r"/*": {"origins": "https://chic-zabaione-9b6957.netlify.app"}
+    })
 
     # --- DEFINIÇÃO DAS ROTAS ---
     COINGECKO_MAP = {
@@ -163,7 +163,7 @@ def create_app():
             pair_name = sinal_data.get("pair")
             if not pair_name or sinal_data.get("signal") == "ERROR": return
             
-            with app.app_context(): # Contexto necessário para operações de DB fora de uma rota
+            with app.app_context():
                 sinais_existentes = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
                 if len(sinais_existentes) >= 10: db.session.delete(sinais_existentes[0])
                 
@@ -180,7 +180,7 @@ def create_app():
 
     @app.route("/")
     def home():
-        return jsonify({"message": "Crypton Signals API v11.0 - Production Ready", "status": "online"})
+        return jsonify({"message": "Crypton Signals API v12.0 - CORS Fixed", "status": "online"})
 
     @app.route("/signals")
     @cache.cached()
@@ -190,7 +190,7 @@ def create_app():
         for symbol in COINGECKO_MAP.keys():
             signal = get_technical_signal(symbol)
             signals.append(signal)
-            time.sleep(2) # Pausa para não exceder o limite da API da CoinGecko
+            time.sleep(2)
             if signal.get("signal") != "ERROR" and "ALERTA" not in signal.get("signal"):
                 salvar_sinal_no_historico(signal)
         return jsonify({"signals": signals, "count": len(signals), "timestamp": datetime.now().isoformat()})
@@ -257,12 +257,8 @@ def create_app():
 
     return app
 
-# Esta linha cria a instância da aplicação que o Gunicorn vai usar.
-# Ela só é executada uma vez quando o Gunicorn inicia o processo.
 app = create_app()
 
-# Este bloco só é executado se você rodar o arquivo diretamente com "python main.py".
-# O Gunicorn não executa este bloco.
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
