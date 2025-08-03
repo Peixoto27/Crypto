@@ -74,3 +74,4 @@ O objetivo é fornecer sinais de COMPRA, VENDA ou HOLD baseados em análise téc
 
 - O **backend** está configurado para deploy na [Railway](https://railway.app/ ) usando o `Procfile`.
 - O **frontend** está configurado para deploy em serviços como [Netlify](https://www.netlify.com/ ) ou [Vercel](https://vercel.com/ ).
+
