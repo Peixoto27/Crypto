@@ -84,7 +84,6 @@ const HistoryChart = ({ chartData }) => {
     grid: {
       borderColor: '#555'
     },
-    // ✅ LÓGICA CORRIGIDA PARA OS MARCADORES
     annotations: {
       points: chartData.markers.map(marker => ({
         x: marker.timestamp,
@@ -132,7 +131,8 @@ function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalContent, setModalContent] = useState({ pair: '', history: [], chartData: null });
 
-  const API_URL = 'https://reliable-mercy-production.up.railway.app';
+  // ✅ CORREÇÃO APLICADA AQUI!
+  const API_URL = 'https://kind-perfection-production-6085.up.railway.app';
 
   useEffect(( ) => {
     const fetchSignals = async () => {
