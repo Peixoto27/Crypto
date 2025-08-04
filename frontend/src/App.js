@@ -1,12 +1,10 @@
+// src/App.js
 import React, { useState, useEffect } from 'react';
 import Chart from 'react-apexcharts';
 import './App.css';
 
-// --- COMPONENTES ---
-
-// Componente para o cartão de cada criptomoeda
 const SignalCard = ({ signal, onHistoryClick }) => {
-  const signalType = signal.signal.split(' ')[0]; // Pega apenas a palavra principal (BUY, SELL, HOLD, ALERTA)
+  const signalType = signal.signal.split(' ')[0];
   const isError = signalType === 'ERROR';
   const isSqueeze = signalType === 'ALERTA';
 
@@ -17,11 +15,12 @@ const SignalCard = ({ signal, onHistoryClick }) => {
         {isError ? 'ERRO' : signal.signal}
       </div>
       <div className="signal-details">
-        <p><strong>Entrada:</strong> $ {isError ? '' : signal.entry}</p>
-        <p><strong>Alvo:</strong> $ {isError ? '' : signal.target}</p>
-        <p><strong>Stop:</strong> $ {isError ? '' : signal.stop}</p>
-        <p><strong>RSI:</strong> {isError ? '' : signal.rsi}</p>
-        <p><strong>BB:</strong> {isError ? '' : `$${signal.bb_lower} - $${signal.bb_upper}`}</p>
+        <p><strong>Entrada:</strong> $ {isError ? '-' : signal.entry}</p>
+        <p><strong>Alvo:</strong> $ {isError ? '-' : signal.target}</p>
+        <p><strong>Stop:</strong> $ {isError ? '-' : signal.stop}</p>
+        <p><strong>RSI:</strong> {isError ? '-' : signal.rsi}</p>
+        <p><strong>BB:</strong> {isError ? '-' : `$${signal.bb_lower} - $${signal.bb_upper}`}</p>
+        <p><strong>Confiança:</strong> {signal.confidence || 'Indefinido'}</p>
       </div>
       <button onClick={() => onHistoryClick(signal.pair)} className="history-button">
         Ver Histórico
@@ -30,7 +29,19 @@ const SignalCard = ({ signal, onHistoryClick }) => {
   );
 };
 
-// Componente para o popup (Modal) do histórico
+const SignalFilter = ({ selectedFilter, onChange }) => (
+  <div className="signal-filter">
+    <label htmlFor="signalFilter">Filtrar por Sinal:</label>
+    <select id="signalFilter" value={selectedFilter} onChange={e => onChange(e.target.value)}>
+      <option value="TODOS">Todos</option>
+      <option value="BUY">Buy</option>
+      <option value="SELL">Sell</option>
+      <option value="HOLD">Hold</option>
+      <option value="ERROR">Erro</option>
+    </select>
+  </div>
+);
+
 const Modal = ({ isOpen, onClose, children }) => {
   if (!isOpen) return null;
   return (
@@ -43,47 +54,26 @@ const Modal = ({ isOpen, onClose, children }) => {
   );
 };
 
-// Componente para o gráfico de histórico
 const HistoryChart = ({ chartData }) => {
   if (!chartData || !chartData.prices || chartData.prices.length === 0) {
     return <p>Não foi possível carregar o gráfico.</p>;
   }
 
   const options = {
-    chart: {
-      type: 'line',
-      height: 350,
-      foreColor: '#e0e0e0'
-    },
-    stroke: {
-      curve: 'smooth',
-      width: 2
-    },
+    chart: { type: 'line', height: 350, foreColor: '#e0e0e0' },
+    stroke: { curve: 'smooth', width: 2 },
     xaxis: {
       type: 'datetime',
-      labels: {
-        style: {
-          colors: '#e0e0e0'
-        }
-      }
+      labels: { style: { colors: '#e0e0e0' } }
     },
     yaxis: {
       labels: {
-        formatter: (value) => `$${value.toFixed(2)}`,
-        style: {
-          colors: '#e0e0e0'
-        }
+        formatter: value => `$${value.toFixed(2)}`,
+        style: { colors: '#e0e0e0' }
       }
     },
-    tooltip: {
-      theme: 'dark',
-      x: {
-        format: 'dd MMM yyyy'
-      }
-    },
-    grid: {
-      borderColor: '#555'
-    },
+    tooltip: { theme: 'dark', x: { format: 'dd MMM yyyy' } },
+    grid: { borderColor: '#555' },
     annotations: {
       points: chartData.markers.map(marker => ({
         x: marker.timestamp,
@@ -109,11 +99,7 @@ const HistoryChart = ({ chartData }) => {
     }
   };
 
-  const series = [{
-    name: 'Preço',
-    data: chartData.prices
-  }];
-
+  const series = [{ name: 'Preço', data: chartData.prices }];
   return (
     <div className="chart-container">
       <h4>Histórico de Preço com Sinais</h4>
@@ -122,25 +108,22 @@ const HistoryChart = ({ chartData }) => {
   );
 };
 
-
-// --- COMPONENTE PRINCIPAL DA APLICAÇÃO ---
 function App() {
   const [signals, setSignals] = useState([]);
+  const [filtered, setFiltered] = useState([]);
+  const [filter, setFilter] = useState('TODOS');
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalContent, setModalContent] = useState({ pair: '', history: [], chartData: null });
 
-  const API_URL = 'https://kind-perfection-production-6085.up.railway.app';
+  const API_URL = import.meta.env.VITE_API_URL || 'https://kind-perfection-production-6085.up.railway.app';
 
-  useEffect(( ) => {
+  useEffect(() => {
     const fetchSignals = async () => {
       try {
         setLoading(true);
         const response = await fetch(`${API_URL}/signals`);
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
         const data = await response.json();
         setSignals(data.signals || []);
       } catch (e) {
@@ -152,52 +135,41 @@ function App() {
     fetchSignals();
   }, []);
 
+  useEffect(() => {
+    if (filter === 'TODOS') setFiltered(signals);
+    else setFiltered(signals.filter(s => s.signal.toUpperCase().includes(filter)));
+  }, [filter, signals]);
+
   const handleHistoryClick = async (pair) => {
     try {
-      // Busca o histórico em tabela
-      const historyResponse = await fetch(`${API_URL}/signals/history`);
-      if (!historyResponse.ok) throw new Error('Falha ao buscar histórico da tabela.');
-      const historyData = await historyResponse.json();
-      const pairHistoryAll = historyData[pair] || [];
+      const historyRes = await fetch(`${API_URL}/signals/history`);
+      const history = await historyRes.json();
+      const filteredHistory = (history[pair] || []).filter(item => item.signal.includes('BUY') || item.signal.includes('SELL'));
 
-      // ✅ MELHORIA APLICADA AQUI!
-      // Filtra o histórico para incluir apenas sinais de BUY ou SELL.
-      const filteredHistory = pairHistoryAll.filter(item => 
-        item.signal.toUpperCase().includes('BUY') || item.signal.toUpperCase().includes('SELL')
-      );
+      const chartRes = await fetch(`${API_URL}/history/chart_data?pair=${pair}`);
+      const chartData = await chartRes.json();
 
-      // Busca os dados para o gráfico
-      const chartResponse = await fetch(`${API_URL}/history/chart_data?pair=${pair}`);
-      if (!chartResponse.ok) throw new Error('Falha ao buscar dados do gráfico.');
-      const chartData = await chartResponse.json();
-
-      // Passa o histórico JÁ FILTRADO para o modal.
       setModalContent({ pair, history: filteredHistory, chartData });
       setIsModalOpen(true);
     } catch (e) {
       console.error("Erro ao buscar histórico:", e);
-      // Exibe o modal mesmo com erro no gráfico, para mostrar a tabela
-      setModalContent(prevState => ({ ...prevState, pair, history: [], chartData: null }));
+      setModalContent(prev => ({ ...prev, pair, history: [], chartData: null }));
       setIsModalOpen(true);
     }
   };
 
-  if (loading) {
-    return <div className="loading-container"><h1>Carregando Sinais...</h1></div>;
-  }
-
-  if (error) {
-    return <div className="error-container"><h1>{error}</h1></div>;
-  }
+  if (loading) return <div className="loading-container"><h1>Carregando Sinais...</h1></div>;
+  if (error) return <div className="error-container"><h1>{error}</h1></div>;
 
   return (
     <div className="App">
       <header className="App-header">
         <h1>Crypton Signals</h1>
-        <p>Análise técnica para os principais pares de criptomoedas.</p>
+        <p>Monitoramento Técnico + Histórico Validado com Alta Precisão</p>
       </header>
+      <SignalFilter selectedFilter={filter} onChange={setFilter} />
       <main className="signals-grid">
-        {signals.map((signal, index) => (
+        {filtered.map((signal, index) => (
           <SignalCard key={index} signal={signal} onHistoryClick={handleHistoryClick} />
         ))}
       </main>
@@ -207,13 +179,7 @@ function App() {
         <div className="history-table-container">
           <table className="history-table">
             <thead>
-              <tr>
-                <th>Data</th>
-                <th>Sinal</th>
-                <th>Entrada</th>
-                <th>Alvo</th>
-                <th>Stop</th>
-              </tr>
+              <tr><th>Data</th><th>Sinal</th><th>Entrada</th><th>Alvo</th><th>Stop</th></tr>
             </thead>
             <tbody>
               {modalContent.history.length > 0 ? (
@@ -227,9 +193,7 @@ function App() {
                   </tr>
                 ))
               ) : (
-                <tr>
-                  <td colSpan="5">Nenhum sinal de Compra ou Venda no histórico recente.</td>
-                </tr>
+                <tr><td colSpan="5">Nenhum sinal de Compra ou Venda no histórico.</td></tr>
               )}
             </tbody>
           </table>
