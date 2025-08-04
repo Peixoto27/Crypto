@@ -10,12 +10,12 @@ import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
 
-# --- INICIALIZAÇÃO --- 
+# --- INICIALIZAÇÃO ---
 db = SQLAlchemy()
 cache = Cache()
 cors = CORS()
 
-# --- MODELO DA BASE DE DADOS --- 
+# --- MODELO DA BASE DE DADOS ---
 class SinalHistorico(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     pair = db.Column(db.String(20), nullable=False)
@@ -32,29 +32,29 @@ class SinalHistorico(db.Model):
             data['timestamp'] = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
         return data
 
-# --- FUNÇÃO DE CRIAÇÃO DA APLICAÇÃO (APPLICATION FACTORY) --- 
+# --- FUNÇÃO DE CRIAÇÃO DA APLICAÇÃO (APPLICATION FACTORY) ---
 def create_app():
     app = Flask(__name__)
-    logging.basicConfig(level=logging.INFO, format=\'%(asctime)s - %(levelname)s - %(message)s\')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     # Configurações
     cache_config = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 21600}
     app.config.from_mapping(cache_config)
-    db_url = os.environ.get(\'DATABASE_URL\')
+    db_url = os.environ.get('DATABASE_URL')
     if not db_url:
         raise RuntimeError("ERRO CRÍTICO: A variável de ambiente DATABASE_URL não foi encontrada.")
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
-    app.config[\'SQLALCHEMY_DATABASE_URI\'] = db_url
-    app.config[\'SQLALCHEMY_TRACK_MODIFICATIONS\'] = False
-    app.config[\'COINGECKO_API_KEY\'] = os.environ.get(\'COINGECKO_API_KEY\')
+    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config['COINGECKO_API_KEY'] = os.environ.get('COINGECKO_API_KEY')
 
     # Inicialização das extensões
     db.init_app(app)
     cache.init_app(app)
     cors.init_app(app)
 
-    # --- CONTEXTO DA APLICAÇÃO E ROTAS --- 
+    # --- CONTEXTO DA APLICAÇÃO E ROTAS ---
     with app.app_context():
         COINGECKO_MAP = {
             "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "XRPUSDT": "ripple",
@@ -63,10 +63,10 @@ def create_app():
 
         def get_coingecko_data(url):
             headers = {}
-            api_key = app.config.get(\'COINGECKO_API_KEY\')
+            api_key = app.config.get('COINGECKO_API_KEY')
             if api_key:
-                headers[\'x-cg-demo-api-key\'] = api_key
-            
+                headers['x-cg-demo-api-key'] = api_key
+
             response = requests.get(url, headers=headers, timeout=20)
             response.raise_for_status()
             return response.json()
@@ -75,59 +75,54 @@ def create_app():
             try:
                 coingecko_id = COINGECKO_MAP.get(symbol)
                 logging.info(f"Buscando dados de 365 dias para {symbol} (com chave de API)")
-                url = f\'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily\'
-                all_data = get_coingecko_data(url )
+                url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=365&interval=daily'
+                all_data = get_coingecko_data(url)
 
-                df_full = pd.DataFrame(all_data[\'prices\'], columns=[\'timestamp\', \'close\'])
-                df_full_volumes = pd.DataFrame(all_data[\'total_volumes\'], columns=[\'timestamp\', \'volume\'])
-                df_full.set_index(\'timestamp\', inplace=True)
-                df_full_volumes.set_index(\'timestamp\', inplace=True)
-                df_full = df_full.join(df_full_volumes, how=\'inner\').reset_index()
-                df_full[\'date\'] = pd.to_datetime(df_full[\'timestamp\'], unit=\'ms\')
+                df_full = pd.DataFrame(all_data['prices'], columns=['timestamp', 'close'])
+                df_full_volumes = pd.DataFrame(all_data['total_volumes'], columns=['timestamp', 'volume'])
+                df_full.set_index('timestamp', inplace=True)
+                df_full_volumes.set_index('timestamp', inplace=True)
+                df_full = df_full.join(df_full_volumes, how='inner').reset_index()
+                df_full['date'] = pd.to_datetime(df_full['timestamp'], unit='ms')
 
                 df_daily = df_full.tail(90).copy()
                 if df_daily.empty: raise Exception("DataFrame diário vazio.")
-                
+
                 df_daily.ta.rsi(length=14, append=True)
-                df_daily.ta.sma(close=\'close\', length=10, append=True)
-                df_daily.ta.sma(close=\'close\', length=30, append=True)
+                df_daily.ta.sma(close='close', length=10, append=True)
+                df_daily.ta.sma(close='close', length=30, append=True)
                 df_daily.ta.bbands(length=20, append=True)
-                df_daily[\'volume_sma_20\'] = df_daily[\'volume\'].rolling(window=20).mean()
+                df_daily['volume_sma_20'] = df_daily['volume'].rolling(window=20).mean()
                 df_daily.dropna(inplace=True)
                 if df_daily.empty: raise Exception("Dados diários insuficientes para análise.")
                 last_daily, prev_daily = df_daily.iloc[-1], df_daily.iloc[-2]
 
-                df_weekly = df_full.resample(\'W-SUN\', on=\'date\').last()
+                df_weekly = df_full.resample('W-SUN', on='date').last()
                 if df_weekly.empty: raise Exception("DataFrame semanal vazio.")
-                df_weekly[\'SMA_10_weekly\'] = df_weekly[\'close\'].rolling(window=10).mean()
+                df_weekly['SMA_10_weekly'] = df_weekly['close'].rolling(window=10).mean()
                 df_weekly.dropna(inplace=True)
                 if df_weekly.empty: raise Exception("Dados semanais insuficientes para SMA_10.")
                 last_weekly = df_weekly.iloc[-1]
-                
+
                 signal_type = "HOLD"
                 confidence = ""
-                entry_price = float(last_daily[\'close\'])
+                entry_price = float(last_daily['close'])
 
-                # --- LÓGICA DE SINAIS (ESTRATÉGIA DUPLA) --- 
-                
-                # 1. Estratégia de Seguimento de Tendência
-                is_in_squeeze = last_daily.get(\'BBB_20_2.0\', 1) < 0.1
+                # Estratégia de Seguimento de Tendência
+                is_in_squeeze = last_daily.get('BBB_20_2.0', 1) < 0.1
                 if is_in_squeeze:
                     signal_type = "ALERTA"
                     confidence = " (Squeeze: Volatilidade Iminente)"
                 else:
-                    trend_buy_cond = last_daily[\'SMA_10\'] > last_daily[\'SMA_30\'] and prev_daily[\'SMA_10\'] <= prev_daily[\'SMA_30\']
-                    trend_sell_cond = last_daily[\'SMA_10\'] < last_daily[\'SMA_30\'] and prev_daily[\'SMA_10\'] >= prev_daily[\'SMA_30\']
-                    
-                    # ALTERAÇÃO AQUI: RSI mais permissivo para gerar mais sinais
-                    rsi_check_buy = last_daily.get(\'RSI_14\', 50) < 75  # Era < 70
-                    rsi_check_sell = last_daily.get(\'RSI_14\', 50) > 25 # Era > 30
-                    
-                    # ALTERAÇÃO AQUI: Volume mais permissivo para gerar mais sinais
-                    volume_check = last_daily[\'volume\'] > (last_daily[\'volume_sma_20\'] * 1.10) # Era * 1.20
-                    
-                    weekly_trend_is_up = last_weekly[\'close\'] > last_weekly[\'SMA_10_weekly\']
-                    
+                    trend_buy_cond = last_daily['SMA_10'] > last_daily['SMA_30'] and prev_daily['SMA_10'] <= prev_daily['SMA_30']
+                    trend_sell_cond = last_daily['SMA_10'] < last_daily['SMA_30'] and prev_daily['SMA_10'] >= prev_daily['SMA_30']
+
+                    rsi_check_buy = last_daily.get('RSI_14', 50) < 75
+                    rsi_check_sell = last_daily.get('RSI_14', 50) > 25
+
+                    volume_check = last_daily['volume'] > (last_daily['volume_sma_20'] * 1.10)
+                    weekly_trend_is_up = last_weekly['close'] > last_weekly['SMA_10_weekly']
+
                     if trend_buy_cond and rsi_check_buy and volume_check and weekly_trend_is_up:
                         signal_type = "BUY"
                         confidence = " (Cruzamento de Médias)"
@@ -135,10 +130,10 @@ def create_app():
                         signal_type = "SELL"
                         confidence = " (Cruzamento de Médias)"
 
-                # 2. Estratégia de Reversão à Média (se nenhum sinal de tendência foi encontrado)
+                # Estratégia de Reversão à Média
                 if signal_type == "HOLD":
-                    reversion_buy_cond = last_daily.get(\'BBP_20_2.0\', 0.5) < 0.20 and last_daily.get(\'RSI_14\', 50) < 40
-                    reversion_sell_cond = last_daily.get(\'BBP_20_2.0\', 0.5) > 0.80 and last_daily.get(\'RSI_14\', 50) > 60
+                    reversion_buy_cond = last_daily.get('BBP_20_2.0', 0.5) < 0.20 and last_daily.get('RSI_14', 50) < 40
+                    reversion_sell_cond = last_daily.get('BBP_20_2.0', 0.5) > 0.80 and last_daily.get('RSI_14', 50) > 60
 
                     if reversion_buy_cond:
                         signal_type = "BUY"
@@ -148,11 +143,14 @@ def create_app():
                         confidence = " (Reversão à Média)"
 
                 return {
-                    "pair": symbol.replace("USDT", "/USDT"), "entry": round(entry_price, 4),
-                    "signal": f"{signal_type}{confidence}", "stop": round(entry_price * 0.98, 4),
-                    "target": round(entry_price * 1.03, 4), "rsi": round(last_daily.get(\'RSI_14\', 50), 2),
-                    "bb_upper": round(last_daily.get(\'BBU_20_2.0\', 0), 4),
-                    "bb_lower": round(last_daily.get(\'BBL_20_2.0\', 0), 4),
+                    "pair": symbol.replace("USDT", "/USDT"),
+                    "entry": round(entry_price, 4),
+                    "signal": f"{signal_type}{confidence}",
+                    "stop": round(entry_price * 0.98, 4),
+                    "target": round(entry_price * 1.03, 4),
+                    "rsi": round(last_daily.get('RSI_14', 50), 2),
+                    "bb_upper": round(last_daily.get('BBU_20_2.0', 0), 4),
+                    "bb_lower": round(last_daily.get('BBL_20_2.0', 0), 4),
                     "timestamp": datetime.now().isoformat()
                 }
 
@@ -163,12 +161,14 @@ def create_app():
         def salvar_sinal_no_historico(sinal_data):
             try:
                 pair_name = sinal_data.get("pair")
-                if not pair_name or sinal_data.get("signal") == "ERROR": return
+                if not pair_name or sinal_data.get("signal") == "ERROR":
+                    return
                 sinais_existentes = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
-                if len(sinais_existentes) >= 10: db.session.delete(sinais_existentes[0])
+                if len(sinais_existentes) >= 10:
+                    db.session.delete(sinais_existentes[0])
                 novo_sinal = SinalHistorico(
-                    pair=sinal_data[\'pair\'], entry=sinal_data[\'entry\'], signal=sinal_data[\'signal\'],
-                    stop=sinal_data[\'stop\'], target=sinal_data[\'target\'], rsi=sinal_data[\'rsi\']
+                    pair=sinal_data['pair'], entry=sinal_data['entry'], signal=sinal_data['signal'],
+                    stop=sinal_data['stop'], target=sinal_data['target'], rsi=sinal_data['rsi']
                 )
                 db.session.add(novo_sinal)
                 db.session.commit()
@@ -209,10 +209,10 @@ def create_app():
 
         @app.route("/history/chart_data")
         def get_chart_data():
-            pair_name = request.args.get(\'pair\', type=str)
+            pair_name = request.args.get('pair', type=str)
             if not pair_name:
-                return jsonify({"error": "O parâmetro \'pair\' é obrigatório."}), 400
-            
+                return jsonify({"error": "O parâmetro 'pair' é obrigatório."}), 400
+
             symbol = pair_name.replace("/", "")
             coingecko_id = COINGECKO_MAP.get(symbol)
             if not coingecko_id:
@@ -220,9 +220,9 @@ def create_app():
 
             try:
                 logging.info(f"Buscando dados de preço para o gráfico de {pair_name} (com chave de API)")
-                url = f\'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily\'
-                price_data = get_coingecko_data(url )
-                prices = price_data.get(\'prices\', [])
+                url = f'https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart?vs_currency=usd&days=90&interval=daily'
+                price_data = get_coingecko_data(url)
+                prices = price_data.get('prices', [])
 
                 sinais_do_par = SinalHistorico.query.filter_by(pair=pair_name).order_by(SinalHistorico.timestamp.asc()).all()
                 markers = []
@@ -235,11 +235,7 @@ def create_app():
                             "text": "C" if "BUY" in sinal.signal.upper() else "V"
                         })
 
-                return jsonify({
-                    "prices": prices,
-                    "markers": markers
-                })
-
+                return jsonify({"prices": prices, "markers": markers})
             except Exception as e:
                 logging.error(f"Erro ao buscar dados do gráfico para {pair_name}: {e}")
                 return jsonify({"error": "Não foi possível buscar os dados do gráfico."}), 500
@@ -253,7 +249,7 @@ def create_app():
             except Exception as e:
                 logging.error(f"ERRO AO CRIAR TABELAS: {e}")
                 return jsonify({"error": str(e)}), 500
-        
+
         @app.route("/admin/cache/clear-secret-path")
         def clear_cache():
             try:
@@ -269,4 +265,4 @@ app = create_app()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host=\'0.0.0.0\', port=port)
+    app.run(host='0.0.0.0', port=port)
