@@ -1,76 +1,89 @@
 # -*- coding: utf-8 -*-
-# indicators_extra.py — indicadores “passivos” (Stochastic, Ichimoku, Parabolic SAR)
-# Não alteram o score, a menos que você queira (via EXTRA_SCORE_WEIGHT > 0).
-from typing import List, Tuple
+# indicators_extra.py — compatível com apply_strategies
+# Fornece: stochastic, ichimoku, parabolic_sar, vwap, obv
 
-def stochastic_kd(highs: List[float], lows: List[float], closes: List[float],
-                  k_period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Tuple[List[float], List[float]]:
-    """Stochastic %K e %D (simples)"""
-    k_raw: List[float] = []
-    for i in range(len(closes)):
+from typing import List, Tuple, Optional
+
+# ---------------------------
+# Stochastic Oscillator (%K/%D)
+# ---------------------------
+def stochastic(highs: List[float], lows: List[float], closes: List[float],
+               k_period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    """Retorna listas %K e %D (médias simples)."""
+    n = len(closes)
+    k_raw: List[Optional[float]] = [None] * n
+
+    for i in range(n):
         if i + 1 < k_period:
-            k_raw.append(None); continue
-        window_h = max(highs[i - k_period + 1:i + 1])
-        window_l = min(lows[i - k_period + 1:i + 1])
-        den = (window_h - window_l) or 1e-12
-        k_raw.append((closes[i] - window_l) / den * 100.0)
+            continue
+        wnd_h = max(highs[i - k_period + 1:i + 1])
+        wnd_l = min(lows[i - k_period + 1:i + 1])
+        den = (wnd_h - wnd_l) or 1e-12
+        k_raw[i] = (closes[i] - wnd_l) / den * 100.0
 
     # suaviza %K
-    k_s: List[float] = []
-    for i in range(len(k_raw)):
-        if k_raw[i] is None or i + 1 < smooth_k:
-            k_s.append(None); continue
+    k_s: List[Optional[float]] = [None] * n
+    for i in range(n):
+        if i + 1 < smooth_k:
+            continue
         vals = [v for v in k_raw[i - smooth_k + 1:i + 1] if v is not None]
-        k_s.append(sum(vals) / len(vals) if vals else None)
+        k_s[i] = (sum(vals) / len(vals)) if vals else None
 
-    # %D = média de %K
-    d_s: List[float] = []
-    for i in range(len(k_s)):
-        if k_s[i] is None or i + 1 < smooth_d:
-            d_s.append(None); continue
+    # %D é média de %K
+    d_s: List[Optional[float]] = [None] * n
+    for i in range(n):
+        if i + 1 < smooth_d:
+            continue
         vals = [v for v in k_s[i - smooth_d + 1:i + 1] if v is not None]
-        d_s.append(sum(vals) / len(vals) if vals else None)
+        d_s[i] = (sum(vals) / len(vals)) if vals else None
 
     return k_s, d_s
 
+# ---------------------------
+# Ichimoku (sem shift futuro)
+# ---------------------------
 def ichimoku(highs: List[float], lows: List[float],
              conv_len: int = 9, base_len: int = 26, spanb_len: int = 52):
-    """Retorna (tenkan, kijun, senkou_a, senkou_b) alinhados no fim (sem shift futuro)"""
-    def mid(hh, ll): return (hh + ll) / 2.0
+    """
+    Retorna (tenkan, kijun, senkou_a, senkou_b), alinhados no fim (sem projeção +26).
+    """
+    def mid(h, l): return (h + l) / 2.0
     n = len(highs)
-    tenkan, kijun, span_a, span_b = [None]*n, [None]*n, [None]*n, [None]*n
+    tenkan = [None] * n
+    kijun  = [None] * n
+    span_a = [None] * n
+    span_b = [None] * n
 
     for i in range(n):
         if i + 1 >= conv_len:
             hh = max(highs[i - conv_len + 1:i + 1])
-            ll = min(lows[i - conv_len + 1:i + 1])
+            ll = min(lows [i - conv_len + 1:i + 1])
             tenkan[i] = mid(hh, ll)
-
         if i + 1 >= base_len:
             hh = max(highs[i - base_len + 1:i + 1])
-            ll = min(lows[i - base_len + 1:i + 1])
+            ll = min(lows [i - base_len + 1:i + 1])
             kijun[i] = mid(hh, ll)
-
         if tenkan[i] is not None and kijun[i] is not None:
             span_a[i] = (tenkan[i] + kijun[i]) / 2.0
-
         if i + 1 >= spanb_len:
             hh = max(highs[i - spanb_len + 1:i + 1])
-            ll = min(lows[i - spanb_len + 1:i + 1])
+            ll = min(lows [i - spanb_len + 1:i + 1])
             span_b[i] = mid(hh, ll)
 
     return tenkan, kijun, span_a, span_b
 
+# ---------------------------
+# Parabolic SAR (simplificado)
+# ---------------------------
 def parabolic_sar(highs: List[float], lows: List[float],
-                  step: float = 0.02, max_step: float = 0.2) -> List[float]:
-    """PSAR simplificado"""
+                  step: float = 0.02, max_step: float = 0.2) -> List[Optional[float]]:
     n = len(highs)
     if n == 0:
         return []
-    psar = [None] * n
-    bull = True  # começa supõe alta
+    psar: List[Optional[float]] = [None] * n
+    bull = True
     af = step
-    ep = highs[0]  # extreme point
+    ep = highs[0]
     ps = lows[0]
     psar[0] = ps
 
@@ -100,3 +113,47 @@ def parabolic_sar(highs: List[float], lows: List[float],
                     af = min(max_step, af + step)
 
     return psar
+
+# ---------------------------
+# VWAP (precisa de volumes)
+# ---------------------------
+def vwap(highs: List[float], lows: List[float], closes: List[float], volumes: Optional[List[float]] = None) -> List[Optional[float]]:
+    """
+    VWAP = soma(Típico*Vol) / soma(Vol)
+    Se volumes for None ou vazio, retorna lista de None (evita crash).
+    """
+    n = len(closes)
+    if not volumes or len(volumes) != n:
+        return [None] * n
+
+    vwap_series: List[Optional[float]] = [None] * n
+    pv_cum = 0.0
+    v_cum  = 0.0
+    for i in range(n):
+        tp = (highs[i] + lows[i] + closes[i]) / 3.0
+        vol = max(float(volumes[i]), 0.0)
+        pv_cum += tp * vol
+        v_cum  += vol
+        vwap_series[i] = (pv_cum / v_cum) if v_cum > 0 else None
+    return vwap_series
+
+# ---------------------------
+# OBV (precisa de volumes)
+# ---------------------------
+def obv(closes: List[float], volumes: Optional[List[float]] = None) -> List[Optional[float]]:
+    """
+    On-Balance Volume. Se volumes ausentes, devolve None para não quebrar.
+    """
+    n = len(closes)
+    if not volumes or len(volumes) != n:
+        return [None] * n
+
+    out: List[Optional[float]] = [0.0] + [None] * (n - 1)
+    for i in range(1, n):
+        if closes[i] > closes[i - 1]:
+            out[i] = out[i - 1] + volumes[i]
+        elif closes[i] < closes[i - 1]:
+            out[i] = out[i - 1] - volumes[i]
+        else:
+            out[i] = out[i - 1]
+    return out
