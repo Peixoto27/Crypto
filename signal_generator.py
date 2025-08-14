@@ -1,42 +1,69 @@
-# signal_generator.py
-from typing import Dict, Any
-from signal_model import normalize_signal  # ✅ Ajustado para singular
-import json
-import os
+# -*- coding: utf-8 -*-
+"""
+signal_generator.py
+- Camada simples para salvar/ler sinais em signals.json
+- Sanitiza valores (evita float(tuple) e outros formatos)
+"""
+import os, json
+from typing import Dict, Any, List
+from signals_model import normalize_signal  # mantém padrão único
 
-SIGNALS_FILE = "signals.json"
+SIGNALS_FILE = os.getenv("SIGNALS_FILE", "signals.json")
 
-def append_signal(signal: Dict[str, Any]):
+def _ensure_file(path: str, default):
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(default, f, ensure_ascii=False, indent=2)
+
+_ensure_file(SIGNALS_FILE, [])  # lista de sinais abertos/atuais
+
+def _num(x, default=None):
     """
-    Adiciona um novo sinal ao arquivo signals.json.
+    Converte com segurança para float:
+      - tupla/lista -> primeiro elemento numérico
+      - string -> float se possível
+      - None -> default
     """
-    # Normaliza o sinal antes de salvar
-    signal = normalize_signal(signal)
+    if x is None:
+        return default
+    if isinstance(x, (list, tuple)) and x:
+        return _num(x[0], default)
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        try:
+            return float(x.strip())
+        except Exception:
+            return default
+    return default
 
-    # Carrega sinais existentes
-    if os.path.exists(SIGNALS_FILE):
-        with open(SIGNALS_FILE, "r") as f:
-            try:
-                signals = json.load(f)
-            except json.JSONDecodeError:
-                signals = []
-    else:
-        signals = []
+def load_signals() -> List[Dict[str, Any]]:
+    try:
+        with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
 
-    # Adiciona novo sinal
-    signals.append(signal)
+def save_signals(rows: List[Dict[str, Any]]) -> None:
+    with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
 
-    # Salva de volta
-    with open(SIGNALS_FILE, "w") as f:
-        json.dump(signals, f, indent=4)
-
-    print(f"✅ Sinal adicionado: {signal['symbol']} | Confiança: {signal['confidence']:.2f}")
-
-def normalize_and_save(signals_list):
+def append_signal(sig: Dict[str, Any]) -> None:
     """
-    Normaliza todos os sinais e salva no arquivo.
+    Sanitiza campos numéricos antes de normalizar/salvar
+    (previne 'float() ... not tuple').
     """
-    normalized = [normalize_signal(s) for s in signals_list]
-    with open(SIGNALS_FILE, "w") as f:
-        json.dump(normalized, f, indent=4)
-    print(f"💾 {len(normalized)} sinais salvos.")
+    # saneamento local
+    sig = dict(sig or {})
+    sig["entry"]      = _num(sig.get("entry"))
+    sig["tp"]         = _num(sig.get("tp"))
+    sig["sl"]         = _num(sig.get("sl"))
+    sig["rr"]         = _num(sig.get("rr"), 2.0)
+    sig["confidence"] = _num(sig.get("confidence"), 0.0)
+
+    # aplica formatação padrão do projeto
+    norm = normalize_signal(sig)
+
+    data = load_signals()
+    data.append(norm)
+    save_signals(data)
