@@ -1,219 +1,256 @@
 # -*- coding: utf-8 -*-
+"""
+main.py — pipeline principal
+- Seleciona o conjunto de moedas (dinâmico via CoinGecko ou fixo via env)
+- Coleta OHLC
+- Calcula score técnico
+- (Opcional) mistura com sentimento
+- Gera sinal (entry/tp/sl) quando houver
+- Evita duplicados via positions_manager
+- Envia para o Telegram e grava em signals.json
+"""
+
 import os
 import json
 import time
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, Any, List
 
-# ---- módulos do projeto
-from data_fetcher_coingecko import get_all_coins, fetch_top_symbols, fetch_ohlc
+# ---- Módulos do projeto (já existentes) ----
+from data_fetcher_coingecko import fetch_ohlc, fetch_top_symbols
 from apply_strategies import generate_signal, score_signal
 from notifier_telegram import send_signal_notification
 from positions_manager import should_send_and_register
 from signal_generator import append_signal  # salva no signals.json
 
-# ==========================
+# ---- Sentimento (opcional; se não existir continua normal) ----
+try:
+    from sentiment_analyzer import get_sentiment_score  # [-1..1]
+except Exception:
+    def get_sentiment_score(symbol: str) -> float:
+        return 0.0
+
+# ==============================
 # Config via Environment
-# ==========================
-def _as_bool(v: str, default=False) -> bool:
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+# ==============================
+SYMBOLS = [s for s in os.getenv("SYMBOLS", "").replace(" ", "").split(",") if s]  # vazio = dinâmico
 
-SYMBOLS_ENV      = [s for s in os.getenv("SYMBOLS", "").replace(" ", "").split(",") if s]  # opcional
-TOP_SYMBOLS      = int(os.getenv("TOP_SYMBOLS", "50"))          # tamanho do universo dinâmico
-SELECT_PER_CYCLE = int(os.getenv("SELECT_PER_CYCLE", "12"))     # quantas por ciclo (round-robin)
-DAYS_OHLC        = int(os.getenv("DAYS_OHLC", "14"))
-SCORE_THRESHOLD  = float(os.getenv("SCORE_THRESHOLD", "0.70"))  # corte do score (0..1)
-MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.45"))   # corte da confiança (0..1)
+TOP_SYMBOLS       = int(os.getenv("TOP_SYMBOLS", "100"))          # quando dinâmico
+SELECT_PER_CYCLE  = int(os.getenv("SELECT_PER_CYCLE", "12"))      # quantas moedas por ciclo
+DAYS_OHLC         = int(os.getenv("DAYS_OHLC", "14"))
+MIN_BARS          = int(os.getenv("MIN_BARS", "40"))
 
-COOLDOWN_HOURS       = float(os.getenv("COOLDOWN_HOURS", "6"))
-CHANGE_THRESHOLD_PCT = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
+SCORE_THRESHOLD   = float(os.getenv("SCORE_THRESHOLD", "0.70"))   # limiar do score técnico
+MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.60"))    # limiar da confiança final (após mistura)
 
-DATA_RAW_FILE = os.getenv("DATA_RAW_FILE", "data_raw.json")
-SIGNALS_FILE  = os.getenv("SIGNALS_FILE", "signals.json")
+# anti-duplicados
+COOLDOWN_HOURS        = float(os.getenv("COOLDOWN_HOURS", "6"))
+CHANGE_THRESHOLD_PCT  = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
 
-# estado simples p/ round-robin
-RR_STATE_FILE = os.getenv("RR_STATE_FILE", ".rr_state.json")
+# mistura técnica + sentimento (se quiser usar)
+WEIGHT_TECH = float(os.getenv("WEIGHT_TECH", "1.0"))
+WEIGHT_SENT = float(os.getenv("WEIGHT_SENT", "0.0"))  # 0.0 = ignorar sentimento
 
-# ==========================
-# Utils
-# ==========================
+# arquivos utilitários (iguais aos que você já usa nos logs)
+DATA_RAW_FILE  = os.getenv("DATA_RAW_FILE", "data_raw.json")
+CURSOR_FILE    = os.getenv("CURSOR_FILE", "scan_state.json")   # para rotacionar as moedas
+SIGNALS_FILE   = os.getenv("SIGNALS_FILE", "signals.json")     # usado pelo append_signal
+
+# ==============================
+# Helpers
+# ==============================
 def _ts() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def _save_json(path: str, data: Any):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def _load_json(path: str, default: Any):
-    if not os.path.exists(path):
-        return default
+def _ensure_cursor() -> Dict[str, Any]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(CURSOR_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return default
+        return {"offset": 0, "cycle": 0}
 
-def _load_rr_state() -> Dict[str, int]:
-    return _load_json(RR_STATE_FILE, {"idx": 0})
+def _save_cursor(state: Dict[str, Any]) -> None:
+    with open(CURSOR_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
-def _save_rr_state(state: Dict[str, int]):
-    _save_json(RR_STATE_FILE, state)
+def _rotate(symbols: List[str], take: int) -> List[str]:
+    """Seleciona um 'lote' diferente a cada ciclo, sem repetir as mesmas sempre."""
+    if take <= 0 or not symbols:
+        return symbols
+    st = _ensure_cursor()
+    off = st.get("offset", 0) % len(symbols)
+    batch = []
+    for i in range(min(take, len(symbols))):
+        batch.append(symbols[(off + i) % len(symbols)])
+    # avança o offset para o próximo ciclo
+    st["offset"] = (off + take) % len(symbols)
+    st["cycle"] = int(st.get("cycle", 0)) + 1
+    _save_cursor(st)
+    return batch
 
-def _normalize_ohlc(raw: List[List[float]]) -> List[Dict[str, float]]:
+def _safe_score(ohlc) -> float:
     """
-    raw CoinGecko OHLC = [[timestamp(ms), open, high, low, close], ...]
-    normaliza p/ lista de dicts
+    Chama score_signal e tolera diferentes formatos de retorno:
+      - float 0..1
+      - tuple (score, ...)
+      - dict {"score": 0..1, ...}
     """
-    out = []
-    for r in raw or []:
-        if len(r) < 5:
-            continue
-        out.append({
-            "time": int(r[0]) // 1000,
-            "open": float(r[1]),
-            "high": float(r[2]),
-            "low":  float(r[3]),
-            "close":float(r[4]),
-        })
-    return out
+    try:
+        res = score_signal(ohlc)
+        if isinstance(res, tuple):
+            s = float(res[0])
+        elif isinstance(res, dict):
+            s = float(
+                res.get("score", res.get("value", res.get("confidence", res.get("prob", 0.0))))
+            )
+        else:
+            s = float(res)
+    except Exception:
+        s = 0.0
+    # normaliza se vier em %
+    if s > 1.0:
+        s = s / 100.0
+    # clip 0..1
+    return max(0.0, min(1.0, round(s, 6)))
 
-# ==========================
+def _mix_confidence(score_tech: float, sent: float) -> float:
+    """
+    Junta técnico (0..1) com sentimento (-1..1) => (0..1).
+    WEIGHT_SENT = 0 mantém comportamento 100% técnico.
+    """
+    sent01 = (sent + 1.0) / 2.0  # -1..1 -> 0..1
+    total_w = max(1e-9, WEIGHT_TECH + WEIGHT_SENT)
+    mixed = (WEIGHT_TECH * score_tech + WEIGHT_SENT * sent01) / total_w
+    return max(0.0, min(1.0, mixed))
+
+# ==============================
 # Pipeline principal
-# ==========================
+# ==============================
 def run_pipeline():
     print("🧩 Coletando PREÇOS / OHLC…")
-
-    # ----- universo de símbolos
-    if SYMBOLS_ENV:
-        all_symbols = SYMBOLS_ENV[:]  # lista fixa definida no env
-    else:
-        # top-N dinâmico via CoinGecko
-        top = fetch_top_symbols(TOP_SYMBOLS)
-        # Garante sufixo USDT e caixa alta
-        all_symbols = [s.upper() if s.endswith("USDT") else (s.upper()+"USDT") for s in top]
-
-    if not all_symbols:
-        print("⚠️ Nenhum símbolo disponível neste ciclo.")
-        return
-
-    # round-robin: pega janelinha de SELECT_PER_CYCLE
-    rr = _load_rr_state()
-    start = rr.get("idx", 0)
-    end = start + max(1, min(SELECT_PER_CYCLE, len(all_symbols)))
-    # wrap
-    selected = (all_symbols + all_symbols)[start:end]
-    new_idx = end % len(all_symbols)
-    _save_rr_state({"idx": new_idx})
-
-    print(f"🔎 Moedas deste ciclo ({len(selected)}/{len(all_symbols)}): " + ", ".join(selected))
-
-    # mapa symbol->id do CoinGecko (evita 404 coins//ohlc)
-    symbol_map = get_all_coins()  # { 'BTC': 'bitcoin', ... }
-
-    collected: Dict[str, List[Dict[str, float]]] = {}
+    collected: Dict[str, Any] = {}
     ok_symbols: List[str] = []
 
-    # ----- coleta OHLC
+    # 1) escolhe universo
+    if SYMBOLS:
+        universe = SYMBOLS[:]  # lista fixa via env
+    else:
+        universe = fetch_top_symbols(TOP_SYMBOLS)  # dinâmica no CG
+
+    # 2) rotaciona para este ciclo
+    selected = _rotate(universe, SELECT_PER_CYCLE)
+    print(f"🧪 Moedas deste ciclo ({len(selected)}/{len(universe)}): {', '.join(selected)}")
+
+    # 3) coleta OHLC
     for sym in selected:
         print(f"📊 Coletando OHLC {sym} (days={DAYS_OHLC})…")
-        raw = fetch_ohlc(sym, DAYS_OHLC, symbol_map=symbol_map)
-        if not raw:
-            print(f"⚠️ Falha/indisponível OHLC: {sym}")
-            continue
-        ohlc = _normalize_ohlc(raw)
-        if len(ohlc) < 30:
-            print(f"❌ Dados insuficientes para {sym} (candles={len(ohlc)})")
-            continue
-        collected[sym] = ohlc
-        ok_symbols.append(sym)
-        print(f"   → OK | candles={len(ohlc)}")
+        try:
+            raw = fetch_ohlc(sym, DAYS_OHLC)   # pode retornar list[ [ts, o, h, l, c], ... ] ou dicts
+            if not raw or len(raw) < MIN_BARS:
+                print(f"❌ Dados insuficientes para {sym}")
+                continue
+            # guardamos como veio; já normalizado no fetcher
+            collected[sym] = raw
+            ok_symbols.append(sym)
+            print(f"   → OK | candles={len(raw)}")
+        except Exception as e:
+            print(f"⚠️ Erro OHLC {sym}: {e}")
 
     if not ok_symbols:
         print("❌ Nenhum ativo com OHLC suficiente.")
         return
 
-    # salva raw (inspecionar depois, útil p/ debug/treino)
-    _save_json(DATA_RAW_FILE, {"collected_at": _ts(), "series": list(ok_symbols)})
+    # 4) salva debug
+    try:
+        with open(DATA_RAW_FILE, "w", encoding="utf-8") as f:
+            json.dump({"symbols": ok_symbols, "data": collected}, f, ensure_ascii=False)
+        print(f"💾 Salvo {DATA_RAW_FILE} ({len(ok_symbols)} ativos)")
+    except Exception as e:
+        print(f"⚠️ Falha ao salvar {DATA_RAW_FILE}: {e}")
 
+    # 5) pontua e gera sinais
     saved_count = 0
-
-    # ----- pontuação e geração de sinal
     for sym in ok_symbols:
-        ohlc = collected[sym]
-
-        try:
-            score = float(score_signal(ohlc))  # espera 0..1
-        except Exception as e:
-            print(f"⚠️ {sym}: erro em score_signal: {e}")
-            continue
-
+        ohlc = collected.get(sym)
+        # score técnico
+        score = _safe_score(ohlc)
         print(f"ℹ️ Score {sym}: {round(score*100,1)}% (min {int(SCORE_THRESHOLD*100)}%)")
 
+        # checa limiar técnico
         if score < SCORE_THRESHOLD:
             continue
 
-        # gera sinal técnico (entry/tp/sl)
-        sig = None
+        # sentimento opcional
+        try:
+            sent = get_sentiment_score(sym)
+        except Exception:
+            sent = 0.0
+
+        conf = _mix_confidence(score, sent)
+        if conf < MIN_CONFIDENCE:
+            # abaixo da confiança mínima global
+            continue
+
+        # gera plano (entry/tp/sl)
         try:
             sig = generate_signal(ohlc)
         except Exception as e:
             print(f"⚠️ {sym}: erro em generate_signal: {e}")
+            sig = None
 
-        if not sig or not all(k in sig for k in ("entry","tp","sl")):
+        if not sig or not isinstance(sig, dict):
             print(f"⚠️ {sym}: sem sinal técnico.")
             continue
 
-        # monta payload padrão
-        sig_payload = {
-            "symbol": sym,
-            "entry": float(sig["entry"]),
-            "tp":    float(sig["tp"]),
-            "sl":    float(sig["sl"]),
-            "rr":    float(sig.get("rr", 2.0)),
-            "confidence": float(max(score, MIN_CONFIDENCE)),  # 0..1
-            "strategy": sig.get("strategy", "RSI+MACD+EMA+BB+EXTRA"),
-            "created_at": _ts(),
-            "id": f"{sym}-{int(time.time())}"
-        }
+        # completa o payload do sinal
+        sig["symbol"]     = sym
+        sig["rr"]         = float(sig.get("rr", 2.0))
+        sig["confidence"] = float(conf)
+        sig["strategy"]   = sig.get("strategy", "RSI+MACD+EMA+BB")
+        sig["created_at"] = sig.get("created_at", _ts())
+        if "id" not in sig:
+            sig["id"] = f"{sym}-{int(time.time())}"
 
-        # deduplicação / cooldown
-        ok_to_send, why = should_send_and_register(
-            sig_payload,
+        # anti-duplicado / cooldown
+        ok_to_send, reason = should_send_and_register(
+            {"symbol": sym, "entry": sig.get("entry"), "tp": sig.get("tp"), "sl": sig.get("sl")},
             cooldown_hours=COOLDOWN_HOURS,
             change_threshold_pct=CHANGE_THRESHOLD_PCT
         )
 
         if not ok_to_send:
-            print(f"🔁 {sym}: não enviado ({why}).")
+            # opcional: log de quase-sinal
+            print(f"🟡 {sym} não enviado ({reason}).")
             continue
 
-        # envia ao Telegram
-        pushed = send_signal_notification(
-            symbol=sig_payload["symbol"],
-            entry_price=sig_payload["entry"],
-            target_price=sig_payload["tp"],
-            stop_loss=sig_payload["sl"],
-            risk_reward=sig_payload["rr"],
-            confidence_score=sig_payload["confidence"],
-            strategy=sig_payload["strategy"],
-            created_at=sig_payload["created_at"],
-            signal_id=sig_payload["id"]
-        )
+        # envia para o Telegram
+        pushed = False
+        try:
+            pushed = send_signal_notification({
+                "symbol": sym,
+                "entry_price": sig.get("entry"),
+                "target_price": sig.get("tp"),
+                "stop_loss": sig.get("sl"),
+                "risk_reward": sig.get("rr", 2.0),
+                "confidence_score": round(conf * 100, 2),
+                "strategy": sig.get("strategy", "RSI+MACD+EMA+BB"),
+                "created_at": sig.get("created_at"),
+                "id": sig.get("id"),
+            })
+        except Exception as e:
+            print(f"⚠️ Falha no envio (notifier): {e}")
 
         if pushed:
             print("✅ Notificação enviada.")
         else:
             print("❌ Falha no envio (ver notifier_telegram).")
 
-        # persiste no signals.json
-        append_signal(sig_payload)
-        saved_count += 1
+        # registra no arquivo de sinais
+        try:
+            append_signal(sig)
+            saved_count += 1
+        except Exception as e:
+            print(f"⚠️ Erro ao salvar em {SIGNALS_FILE}: {e}")
 
-    print(f"💾 {saved_count} sinais salvos em {SIGNALS_FILE}")
-    print(f"🕒 Fim: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
-# exec local/manual
-if __name__ == "__main__":
-    run_pipeline()
+    print(f"🗂 {saved_count} sinais salvos em {SIGNALS_FILE}")
+    print(f"🕒 Fim: {_ts()}")
