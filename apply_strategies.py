@@ -1,117 +1,274 @@
 # -*- coding: utf-8 -*-
-import time
-from statistics import fmean
-from indicators import rsi, macd, ema, bollinger
-from indicators_extra import ichimoku, parabolic_sar, stochastic, vwap, obv
-from config import (
-    MIN_CONFIDENCE,
-    USE_TECH_EXTRA, USE_VOLUME_INDICATORS,
-    TECH_W_ICHI, TECH_W_SAR, TECH_W_STOCH,
-    TECH_W_VWAP, TECH_W_OBV
-)
+"""
+apply_strategies.py
+- Calcula score técnico (0..1) e gera um plano simples (entry/tp/sl)
+- Compatível com main.py: aceita extra_log e extra_weight sem quebrar
+"""
 
-def score_signal(closes, highs=None, lows=None, volumes=None):
-    if len(closes) < 60:
-        return None
+from typing import List, Dict, Any, Tuple
+import math
 
-    # ----- Core (existente) -----
-    r = rsi(closes, 14)
-    macd_line, signal_line, hist = macd(closes, 12, 26, 9)
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    bb_up, bb_mid, bb_low = bollinger(closes, 20, 2.0)
+# ========= helpers básicos (sem dependências externas) =========
 
-    i = len(closes) - 1
-    c = closes[i]
+def _sma(vals: List[float], period: int) -> float:
+    if len(vals) < period or period <= 0:
+        return float("nan")
+    return sum(vals[-period:]) / float(period)
 
-    is_rsi_bull   = 45 <= (r[i] or 0) <= 65 if r[i] is not None else False
-    is_macd_cross = (
-        macd_line[i] is not None and signal_line[i] is not None and
-        macd_line[i-1] is not None and signal_line[i-1] is not None and
-        macd_line[i] > signal_line[i] and macd_line[i-1] <= signal_line[i-1]
-    )
-    is_trend_up   = (ema20[i] is not None and ema50[i] is not None and ema20[i] > ema50[i])
-    near_bb_low   = (bb_low[i] is not None) and (c <= bb_low[i]*1.01)
+def _ema(vals: List[float], period: int) -> float:
+    if len(vals) < period or period <= 0:
+        return float("nan")
+    k = 2.0 / (period + 1.0)
+    ema = _sma(vals[:period], period)
+    for v in vals[period:]:
+        ema = v * k + ema * (1.0 - k)
+    return ema
 
-    s_rsi   = 1.0 if is_rsi_bull else (0.6 if (r[i] is not None and 40 <= r[i] <= 70) else 0.0)
-    s_macd  = 1.0 if is_macd_cross else (0.7 if (hist[i] or 0) > 0 else 0.2)
-    s_trend = 1.0 if is_trend_up else 0.3
-    s_bb    = 1.0 if near_bb_low else 0.5
+def _std(vals: List[float], period: int) -> float:
+    if len(vals) < period:
+        return float("nan")
+    s = _sma(vals[-period:], period)
+    var = sum((x - s) ** 2 for x in vals[-period:]) / float(period)
+    return math.sqrt(var)
 
-    scores = [s_rsi, s_macd, s_trend, s_bb]
+def _rsi(vals: List[float], period: int = 14) -> float:
+    if len(vals) < period + 1:
+        return float("nan")
+    gains, losses = 0.0, 0.0
+    for i in range(-period, 0):
+        ch = vals[i] - vals[i - 1]
+        if ch > 0:
+            gains += ch
+        else:
+            losses -= ch
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return 100.0 - (100.0 / (1.0 + rs))
 
-    # ----- Extras sem volume (ativados por flag) -----
-    if USE_TECH_EXTRA and highs is not None and lows is not None:
-        conv, base, span_a, span_b = ichimoku(highs, lows)
-        psar = parabolic_sar(highs, lows)
-        K, D = stochastic(highs, lows, closes)
+def _atr(ohlc: List[Dict[str, float]], period: int = 14) -> float:
+    """ATR clássico (true range médio)."""
+    if len(ohlc) < period + 1:
+        return float("nan")
+    trs: List[float] = []
+    for i in range(1, len(ohlc)):
+        h = float(ohlc[i]["high"])
+        l = float(ohlc[i]["low"])
+        pc = float(ohlc[i - 1]["close"])
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    if len(trs) < period:
+        return float("nan")
+    return sum(trs[-period:]) / float(period)
 
-        i_ok = i < len(span_a) and i < len(span_b) and i < len(conv) and i < len(base)
-        ichi_bull = (i_ok and span_a[i] is not None and span_b[i] is not None and conv[i] is not None and base[i] is not None
-                     and c > span_a[i] > span_b[i] and conv[i] >= base[i])
+# ========= indicadores “extra” (opcionais) =========
+# Se existir o arquivo indicators_extra.py, usamos. Se não, seguimos sem eles.
+try:
+    from indicators_extra import ichimoku, parabolic_sar, stochastic, vwap, obv  # type: ignore
+    _HAS_EXTRA = True
+except Exception:
+    _HAS_EXTRA = False
 
-        sar_bull  = (psar[i] is not None and c > psar[i] and (i>0 and (psar[i-1] is None or c <= psar[i-1])==False))
+# ========= cálculo do score =========
 
-        st_cross = (K[i] is not None and D[i] is not None and i>0 and K[i] > D[i] and (K[i-1] or 0) <= (D[i-1] or 0))
-        st_zone  = (K[i] is not None and 20 <= K[i] <= 80)
+def _base_tech_components(ohlc: List[Dict[str, float]]) -> Dict[str, float]:
+    closes = [float(x["close"]) for x in ohlc]
+    score_bits = {}
 
-        s_ichi  = (1.0 if ichi_bull else 0.6) * TECH_W_ICHI
-        s_sar   = (1.0 if sar_bull  else 0.5) * TECH_W_SAR
-        s_stoch = (1.0 if (st_cross and st_zone) else (0.6 if st_zone else 0.3)) * TECH_W_STOCH
-        scores.extend([s_ichi, s_sar, s_stoch])
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    macd = ema12 - ema26 if not math.isnan(ema12) and not math.isnan(ema26) else float("nan")
+    sig9 = _ema([macd] * 9 + [macd], 9) if not math.isnan(macd) else float("nan")  # aproxima
 
-        # ----- Com volume (só se houver volumes E flag ligada) -----
-        if USE_VOLUME_INDICATORS and volumes is not None:
-            vwap_arr = vwap(highs, lows, closes, volumes)
-            obv_arr  = obv(closes, volumes)
-            s_vwap = 1.0 if (vwap_arr[i] is not None and c >= vwap_arr[i]) else 0.5
-            s_obv  = 1.0 if (obv_arr[i]  is not None and i>0 and obv_arr[i] > obv_arr[i-1]) else 0.5
-            scores.extend([s_vwap * TECH_W_VWAP, s_obv * TECH_W_OBV])
+    ema50 = _ema(closes, 50)
+    ema200 = _ema(closes, 200)
 
-    # agregação + leve normalização por hist (proxy volatilidade)
-    score = fmean(scores)
-    recent = [abs(h) for h in hist[-20:] if h is not None]
-    if recent:
-        vol_boost = min(max(abs(hist[i]) / (max(recent) + 1e-9), 0.0), 1.0)
-        score = 0.85*score + 0.15*vol_boost
-    return max(0.0, min(1.0, score))
+    rsi14 = _rsi(closes, 14)
 
-def build_trade_plan(closes, highs=None, lows=None, risk_ratio_tp=2.0, risk_ratio_sl=1.0):
-    if len(closes) < 30:
-        return None
-    import statistics
+    bb_mid = _sma(closes, 20)
+    bb_std = _std(closes, 20)
     last = closes[-1]
-    diffs = [abs(closes[j] - closes[j-1]) for j in range(-15, 0)]
-    atr_like = statistics.fmean(diffs)
-    sl = last - (atr_like * risk_ratio_sl)
-    tp = last + (atr_like * risk_ratio_tp)
-    return {"entry": last, "tp": tp, "sl": sl}
 
-def generate_signal(symbol, candles):
-    closes = [c["close"] for c in candles]
-    highs  = [c.get("high") for c in candles]
-    lows   = [c.get("low")  for c in candles]
-    volumes= [c.get("volume") for c in candles] if "volume" in candles[0] else None
+    # regras simples -> pontinhos 0..1
+    pts = 0.0
+    total = 0.0
 
-    score = score_signal(closes, highs, lows, volumes)
-    if score is None:
+    # MACD acima da linha de sinal
+    total += 1
+    if not math.isnan(macd) and not math.isnan(sig9) and macd >= sig9:
+        pts += 1
+    score_bits["macd"] = 1.0 if not math.isnan(macd) and not math.isnan(sig9) and macd >= sig9 else 0.0
+
+    # Preço acima da EMA50
+    total += 1
+    if not math.isnan(ema50) and last >= ema50:
+        pts += 1
+    score_bits["ema50"] = 1.0 if not math.isnan(ema50) and last >= ema50 else 0.0
+
+    # EMA50 acima da EMA200 (tendência primária)
+    total += 1
+    if not math.isnan(ema50) and not math.isnan(ema200) and ema50 >= ema200:
+        pts += 1
+    score_bits["ema_trend"] = 1.0 if not math.isnan(ema50) and not math.isnan(ema200) and ema50 >= ema200 else 0.0
+
+    # RSI saudável (50–70)
+    total += 1
+    if not math.isnan(rsi14) and 50 <= rsi14 <= 70:
+        pts += 1
+    score_bits["rsi"] = 1.0 if not math.isnan(rsi14) and 50 <= rsi14 <= 70 else 0.0
+
+    # Preço acima da BB média
+    total += 1
+    if not math.isnan(bb_mid) and last >= bb_mid:
+        pts += 1
+    score_bits["bb"] = 1.0 if not math.isnan(bb_mid) and last >= bb_mid else 0.0
+
+    base = pts / total if total > 0 else 0.0
+    score_bits["base"] = base
+    return score_bits
+
+def _extra_components(ohlc: List[Dict[str, float]]) -> Dict[str, float]:
+    """Componentes extra (Ichimoku, SAR, Stoch, VWAP, OBV). 0..1 cada."""
+    res = {"ichimoku": 0.0, "sar": 0.0, "stoch": 0.0, "vwap": 0.0, "obv": 0.0}
+    if not _HAS_EXTRA:
+        return res
+    closes = [float(x["close"]) for x in ohlc]
+    highs = [float(x["high"]) for x in ohlc]
+    lows  = [float(x["low"]) for x in ohlc]
+
+    try:
+        ich = ichimoku(highs, lows, closes)  # retorno boolean/score
+        res["ichimoku"] = 1.0 if ich else 0.0
+    except Exception:
+        pass
+    try:
+        psar_up = parabolic_sar(highs, lows, closes)  # True=compra
+        res["sar"] = 1.0 if psar_up else 0.0
+    except Exception:
+        pass
+    try:
+        st = stochastic(highs, lows, closes)  # retorna (k, d)
+        k, d = st if isinstance(st, (list, tuple)) and len(st) >= 2 else (0.0, 0.0)
+        res["stoch"] = 1.0 if k > d and k < 80 else 0.0
+    except Exception:
+        pass
+    try:
+        above = vwap(ohlc)  # True se preço acima do VWAP
+        res["vwap"] = 1.0 if above else 0.0
+    except Exception:
+        pass
+    try:
+        obv_dir = obv(ohlc)  # True se OBV ascendendo
+        res["obv"] = 1.0 if obv_dir else 0.0
+    except Exception:
+        pass
+    return res
+
+def score_signal(
+    prices: List[Dict[str, float]],
+    use_ai: bool = False,
+    ai_model: Any = None,
+    extra_weight: float = 0.0,
+    extra_log: bool = False,
+    **kwargs
+) -> float:
+    """
+    Retorna score 0..1. Combina:
+      - base técnico (MACD/EMA/RSI/BB)
+      - extras (Ichimoku, SAR, Stoch, VWAP, OBV) com peso 'extra_weight'
+      - IA (se houver), suavemente (média ponderada)
+    Aceita extra_log para debug sem quebrar o main.
+    """
+    if not prices or len(prices) < 30:
+        return 0.0
+
+    bits = _base_tech_components(prices)
+    base = bits["base"]
+
+    extras = _extra_components(prices)
+    if extra_weight > 0.0:
+        ex_vals = list(extras.values())
+        ex_avg = sum(ex_vals) / len(ex_vals) if ex_vals else 0.0
+        tech = max(0.0, min(1.0, (1 - extra_weight) * base + extra_weight * ex_avg))
+    else:
+        tech = base
+
+    # componente IA (opcional)
+    if use_ai and ai_model is not None:
+        try:
+            closes = [float(x["close"]) for x in prices]
+            feat = [
+                closes[-1],
+                _ema(closes, 12) or 0.0,
+                _ema(closes, 26) or 0.0,
+                _rsi(closes, 14) or 0.0,
+            ]
+            ai_raw = float(ai_model.predict_proba([feat])[0][1])  # 0..1
+        except Exception:
+            ai_raw = 0.5
+        score = 0.5 * tech + 0.5 * ai_raw
+    else:
+        score = tech
+
+    score = max(0.0, min(1.0, score))
+
+    if extra_log:
+        print(f"[EXTRA] base={base:.2f} extras={extras} final={score:.2f}")
+
+    return score
+
+# ========= geração de sinal simples =========
+
+def _plan_long(ohlc: List[Dict[str, float]], rr: float = 2.0) -> Tuple[float, float, float]:
+    """Entry = close, SL = close - 1*ATR, TP ajustado para R:R desejado."""
+    closes = [float(x["close"]) for x in ohlc]
+    last = closes[-1]
+    atr = _atr(ohlc, 14)
+    if math.isnan(atr) or atr <= 0:
+        atr = last * 0.005  # fallback 0,5%
+    sl = last - atr
+    tp = last + rr * (last - sl)
+    return last, tp, sl
+
+def generate_signal(
+    prices: List[Dict[str, float]],
+    rr: float = 2.0,
+    extra_log: bool = False,
+    **kwargs
+) -> Dict[str, Any] | None:
+    """
+    Gera um sinal LONG básico quando o conjunto técnico está positivo:
+      - MACD>signal, preço>EMA50, EMA50>EMA200, RSI entre 50-70, preço>BB mid.
+    Retorna dict com: entry, tp, sl, rr, strategy.
+    """
+    if not prices or len(prices) < 30:
         return None
 
-    plan = build_trade_plan(closes, highs, lows)
-    if plan is None:
+    bits = _base_tech_components(prices)
+    ok = (
+        bits.get("macd", 0.0) > 0.5 and
+        bits.get("ema50", 0.0) > 0.5 and
+        bits.get("ema_trend", 0.0) > 0.5 and
+        bits.get("rsi", 0.0) > 0.5 and
+        bits.get("bb", 0.0) > 0.5
+    )
+
+    # Se tiver extras, pedimos pelo menos 2/5 positivos — deixa mais criterioso.
+    if _HAS_EXTRA:
+        ex = _extra_components(prices)
+        if sum(1 for v in ex.values() if v > 0.5) < 2:
+            ok = False
+        if extra_log:
+            print(f"[EXTRA] gate extras={ex} ok={ok}")
+
+    if not ok:
         return None
 
-    sig = {
-        "symbol": symbol,
-        "timestamp": int(time.time()),
-        "confidence": round(score, 4),
-        "entry": plan["entry"],
-        "tp": plan["tp"],
-        "sl": plan["sl"],
-        "strategy": "RSI+MACD+EMA+BB" + ("+EXTRA" if USE_TECH_EXTRA else "") + ("+VOL" if USE_VOLUME_INDICATORS else ""),
-        "source": "coingecko"
+    entry, tp, sl = _plan_long(prices, rr=rr)
+    return {
+        "entry": float(entry),
+        "tp": float(tp),
+        "sl": float(sl),
+        "rr": float(rr),
+        "strategy": "RSI+MACD+EMA+BB+EXTRA" if _HAS_EXTRA else "RSI+MACD+EMA+BB",
     }
-    thr = MIN_CONFIDENCE if MIN_CONFIDENCE<=1 else MIN_CONFIDENCE/100.0
-    if sig["confidence"] < thr:
-        return None
-    return sig
