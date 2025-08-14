@@ -238,6 +238,16 @@ def run_pipeline():
         saved_count += 1
 
     print(f"💾 {saved_count} sinais salvos em {SIGNALS_FILE}")
+    # ... seu pipeline normal acima
+
+# salvar data_raw.json já existe
+
+# === depois de gerar/enviar sinais ===
+try:
+    from auto_labeler import auto_close_by_ohlc
+    auto_close_by_ohlc()
+except Exception as e:
+    print(f"⚠️ AUTO_LABEL falhou: {e}")
     print(f"🕒 Fim: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
 
