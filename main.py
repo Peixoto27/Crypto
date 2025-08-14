@@ -1,196 +1,219 @@
 # -*- coding: utf-8 -*-
-import os, json, time
+"""
+main.py — pipeline completo com fast-lane + rotação
+- Seleciona símbolos (fixos + rotação)
+- Coleta OHLC (CoinGecko)
+- Gera sinal técnico (signal_generator)
+- Agrega sentimento (sentiment_analyzer)
+- Filtra por SCORE_THRESHOLD e MIN_CONFIDENCE
+- Evita duplicados (positions_manager)
+- Notifica Telegram (notifier_telegram)
+"""
+
+import os
+import json
+import time
+import traceback
 from datetime import datetime
 
-from config import (
-    MIN_CONFIDENCE, DEBUG_SCORE, TOP_SYMBOLS,
-    BATCH_OHLC, BATCH_PAUSE_SEC, SYMBOLS,
-    DATA_RAW_FILE, SIGNALS_FILE, OHLC_DAYS,
-    COOLDOWN_HOURS, CHANGE_THRESHOLD_PCT,
-    USE_AI, AI_THRESHOLD,
-    USE_NEWS, NEWS_WEIGHT, NEWS_MAX_BOOST, NEWS_MAX_PEN, NEWS_VETO_NEG,
-    DATA_SOURCE
-)
-from coingecko_client import fetch_bulk_prices, fetch_ohlc, SYMBOL_TO_ID
-from apply_strategies import generate_signal, score_signal
-from notifier_telegram import send_signal_notification
+# -------- dependências do seu projeto --------
+from symbol_rotator import get_next_batch, push_priority
+from coingecko_client import fetch_ohlc                     # retorna candles [{open,high,low,close,ts}, ...]
+from signal_generator import generate_signal                # retorna dict com confidence (técnico) + entry/tp/sl
+from sentiment_analyzer import get_sentiment_score          # retorna polaridade [-1..1]
 from positions_manager import should_send_and_register
+from notifier_telegram import send_signal_notification
 
-# IA (técnica)
-from indicators import rsi, macd, ema, bollinger
-from ai_predictor import load_model, predict_proba, log_if_active
+# ------------- parâmetros por ENV -------------
+DAYS_OHLC        = int(os.getenv("DAYS_OHLC", "14"))
+SCORE_THRESHOLD  = float(os.getenv("SCORE_THRESHOLD", os.getenv("MIN_CONFIDENCE", "0.70")))  # corte final
+MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.70"))  # gate do sentimento (0.0 para desativar)
+WEIGHT_TECH      = float(os.getenv("WEIGHT_TECH", "0.8"))
+WEIGHT_SENT      = float(os.getenv("WEIGHT_SENT", "0.2"))
+COOLDOWN_H       = float(os.getenv("COOLDOWN_HOURS", "6"))
+CHANGE_PCT       = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
+NEAR_MISS_PUSH   = float(os.getenv("NEAR_MISS_PUSH", "0.05"))   # se final ∈ [SCORE_THRESHOLD-NEAR_MISS_PUSH, SCORE_THRESHOLD), empurra p/ prioridade
+DATA_RAW_FILE    = os.getenv("DATA_RAW_FILE", "data_raw.json")
+SIGNALS_FILE     = os.getenv("SIGNALS_FILE", "signals.json")
+DEBUG_SCORE      = os.getenv("DEBUG_SCORE", "True").lower() in ("1", "true", "yes")
 
-# Sentimento (opcional)
-try:
-    import sentiment_analyzer as SA
-except Exception:
-    SA = None
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
-# Volume/CCXT (opcional)
-if os.getenv("USE_VOLUME_INDICATORS","false").lower()=="true" and DATA_SOURCE == "ccxt":
-    from ccxt_client import fetch_ohlcv_binance as fetch_ohlc_with_volume
-else:
-    fetch_ohlc_with_volume = None
+def _to_pct01(x, digits=2):
+    try:
+        return round(float(x), digits)
+    except Exception:
+        return x
 
-def log(msg): print(msg, flush=True)
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+def _to_pct100(x, digits=1):
+    try:
+        return round(float(x)*100.0, digits)
+    except Exception:
+        return x
 
-def build_features(closes):
-    if not closes or len(closes) < 60:
-        return None, None
-    R = rsi(closes, 14); M, S, H = macd(closes, 12, 26, 9)
-    E20 = ema(closes, 20); E50 = ema(closes, 50)
-    # BB não entra como feature aqui — usamos na score
-    i = len(closes) - 1
-    vals = [R[i], M[i], S[i], H[i], E20[i], E50[i]]
-    if any(v is None for v in vals): return None, None
-    sc = score_signal(closes)
-    sc_val = sc[0] if isinstance(sc, tuple) else sc
-    if sc_val is None: return None, None
-    feats = [float(v) for v in vals] + [float(sc_val)]
-    return feats, sc_val
+def _save_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def _append_signals(path, items):
+    existing = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = []
+    existing.extend(items)
+    _save_json(path, existing)
 
 def run_pipeline():
-    # IA técnica
-    model = load_model() if USE_AI else None
-    if model is not None:
-        log_if_active(AI_THRESHOLD)
+    start = datetime.utcnow()
+    print(f"🕒 Início: {start:%Y-%m-%d %H:%M:%S} UTC")
 
-    # Seleção por variação 24h
-    log("🧩 Coletando PREÇOS em lote (bulk)…")
-    bulk = fetch_bulk_prices(SYMBOLS)
+    # -------- seleção de símbolos (fast-lane + rotação + prioridade) --------
+    try:
+        selected = get_next_batch()
+        print(f"✅ Selecionados (fast-lane + rotação): {', '.join(selected)}")
+    except Exception as e:
+        print(f"⚠️ Rotator falhou: {e}. Abortando ciclo para evitar 429 desnecessário.")
+        return
 
-    ranked = []
-    for s in SYMBOLS:
-        info = bulk.get(s)
-        if not info: continue
-        ranked.append((s, abs(float(info.get("usd_24h_change", 0.0)))))
-    ranked.sort(key=lambda t: t[1], reverse=True)
-    selected = [sym for sym, _ in ranked[:max(1, int(TOP_SYMBOLS))]]
-    log(f"✅ Selecionados para OHLC: {', '.join(selected)}")
-
-    # OHLC / coleta por blocos
-    all_data = []
-    for idx, block in enumerate(chunks(selected, max(1, int(BATCH_OHLC)))):
-        if idx > 0:
-            log(f"⏸️ Pausa de {BATCH_PAUSE_SEC}s entre blocos…"); time.sleep(BATCH_PAUSE_SEC)
-        for s in block:
-            if fetch_ohlc_with_volume:
-                log(f"📊 (ccxt) Coletando OHLCV {s} (days={OHLC_DAYS})…")
-                try:
-                    data = fetch_ohlc_with_volume(symbol=s, days=OHLC_DAYS, timeframe="1h")
-                    candles = []
-                    for d in data:
-                        candles.append({
-                            "timestamp": int(datetime.strptime(d["timestamp"], "%Y-%m-%d %H:%M:%S UTC").timestamp()),
-                            "open": d["open"], "high": d["high"], "low": d["low"], "close": d["close"], "volume": d["volume"]
-                        })
-                except Exception as e:
-                    log(f"   → ❌ {s} erro ccxt: {e}")
-                    continue
-            else:
-                cid = SYMBOL_TO_ID.get(s, s.replace("USDT","").lower())
-                log(f"📊 Coletando OHLC {s} (days={OHLC_DAYS})…")
-                data = fetch_ohlc(cid, days=OHLC_DAYS)
-                if not data:
-                    log(f"   → ❌ Dados insuficientes para {s}"); continue
-                candles = [{"timestamp": int(ts/1000), "open": float(o), "high": float(h),
-                            "low": float(l), "close": float(c)} for ts,o,h,l,c in data]
-
-            all_data.append({"symbol": s, "ohlc": candles})
-            log(f"   → OK | candles={len(candles)}")
-
-    with open(DATA_RAW_FILE, "w") as f: json.dump(all_data, f, indent=2)
-    log(f"💾 Salvo {DATA_RAW_FILE} ({len(all_data)} ativos)")
-
-    thr = MIN_CONFIDENCE if MIN_CONFIDENCE <= 1 else MIN_CONFIDENCE/100.0
-    approved = []
-
-    for item in all_data:
-        s = item["symbol"]; ohlc = item["ohlc"]
-        closes = [c["close"] for c in ohlc]
-
-        # 1) Camada técnica base/extra
-        sig = generate_signal(s, ohlc)
-        if not sig:
-            if DEBUG_SCORE:
-                sc = score_signal(closes)
-                shown = "None" if sc is None else f"{round((sc[0] if isinstance(sc, tuple) else sc)*100,1)}%"
-                log(f"ℹ️ Score {s}: {shown} (min {int(thr*100)}%)")
-            else:
-                log(f"⛔ {s} descartado (<{int(thr*100)}%)")
-            continue
-
-        # 2) Sentimento (opcional) — usa seu sentiment_analyzer
-        if USE_NEWS and SA is not None:
-            try:
-                senti = float(SA.get_sentiment_score(s))  # -1..1
-                if senti <= NEWS_VETO_NEG:
-                    log(f"⛔ {s} vetado por sentimento ({round(senti,2)})")
-                    sig = None
-                else:
-                    old = sig["confidence"]
-                    bonus = senti * NEWS_WEIGHT
-                    if bonus > NEWS_MAX_BOOST: bonus = NEWS_MAX_BOOST
-                    if bonus < -NEWS_MAX_PEN:  bonus = -NEWS_MAX_PEN
-                    sig["confidence"] = max(0.0, min(1.0, old + bonus))
-                    log(f"📰 {s} sentimento={round(senti,2)} bonus={round(bonus,3)} conf {round(old,3)}→{round(sig['confidence'],3)}")
-            except Exception as e:
-                log(f"⚠️ sentimento skip: {e}")
-
-        if not sig:
-            continue
-
-        # 3) IA técnica (opcional)
-        ai_ok, ai_proba = True, None
-        if model is not None:
-            feats, _sc = build_features(closes)
-            if feats is not None:
-                ai_proba = predict_proba(model, feats)
-                if ai_proba is not None:
-                    ai_ok = (ai_proba >= AI_THRESHOLD)
-
-        # 4) Decisão final + anti-duplicado
-        if sig["confidence"] >= thr and ai_ok:
-            ok_to_send, why = should_send_and_register(
-                sig,
-                cooldown_hours=COOLDOWN_HOURS,
-                change_threshold_pct=CHANGE_THRESHOLD_PCT
-            )
-            if not ok_to_send:
-                log(f"⏭️ {s} pulado (duplicado: {why}).")
+    # -------- coleta OHLC --------
+    data_raw = {}
+    for sym in selected:
+        try:
+            print(f"📊 Coletando OHLC {sym} (days={DAYS_OHLC})…")
+            candles = fetch_ohlc(sym, days=DAYS_OHLC)
+            if not candles or len(candles) < 40:
+                print(f"⚠️ {sym}: dados insuficientes ({0 if not candles else len(candles)})")
                 continue
+            data_raw[sym] = candles
+        except Exception as e:
+            print(f"⚠️ {sym}: falha ao coletar OHLC: {e}")
 
-            approved.append(sig)
-            proba_txt = f" | IA={round(ai_proba*100,1)}%" if ai_proba is not None else ""
-            prefix = "🧠 [AI] " if ai_proba is not None else ""
-            log(f"✅ {prefix}{s} aprovado ({int(sig['confidence']*100)}%{proba_txt})")
+    try:
+        _save_json(DATA_RAW_FILE, data_raw)
+        print(f"💾 Salvo {DATA_RAW_FILE} ({len(data_raw)} ativos).")
+    except Exception as e:
+        print(f"⚠️ Falha ao salvar {DATA_RAW_FILE}: {e}")
 
-            wire = {
-                "symbol": s,
-                "entry_price": sig["entry"],
-                "target_price": sig["tp"],
-                "stop_loss": sig["sl"],
-                "risk_reward": sig.get("risk_reward"),
-                "confidence_score": round(sig["confidence"]*100, 2),
-                "strategy": sig.get("strategy","RSI+MACD+EMA+BB") + ("+AI" if ai_proba is not None else ""),
-                "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "id": f"{s}-{int(time.time())}",
-                "ai": True if ai_proba is not None else False,
-                "ai_proba": round(ai_proba*100,1) if ai_proba is not None else None
-            }
-            send_signal_notification(wire)
-        else:
-            why = []
-            if sig["confidence"] < thr: why.append("técnico")
-            if model is not None and ai_proba is not None and not ai_ok: why.append(f"IA<{int(AI_THRESHOLD*100)}% ({round(ai_proba*100,1)}%)")
-            log(f"⛔ {s} reprovado: {', '.join(why) if why else 'score baixo'}")
+    # -------- geração + avaliação de sinais --------
+    approved = []
+    near_miss = []
 
-    with open(SIGNALS_FILE, "w") as f: json.dump(approved, f, indent=2)
-    log(f"💾 {len(approved)} sinais salvos em {SIGNALS_FILE}")
-    log(f"🕒 Fim: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    for sym, candles in data_raw.items():
+        # 1) sinal técnico
+        sig = None
+        try:
+            sig = generate_signal(sym, candles)
+        except Exception as e:
+            print(f"⚠️ {sym}: erro em generate_signal: {e}")
 
+        if sig is None:
+            print(f"ℹ️ {sym}: sem sinal técnico.")
+            continue
+
+        tech_conf = float(sig.get("confidence", 0.0))          # [0..1]
+        tech_pct  = _to_pct100(tech_conf)
+
+        # 2) sentimento → normaliza para [0..1]
+        try:
+            senti_raw = float(get_sentiment_score(sym))         # [-1..1]
+        except Exception as e:
+            print(f"⚠️ Sentimento falhou para {sym}: {e}")
+            senti_raw = 0.0
+        senti_conf = _clamp01((senti_raw + 1.0) / 2.0)         # [0..1]
+        senti_pct  = _to_pct100(senti_conf)
+
+        # 3) combinação final
+        final_conf = _clamp01(WEIGHT_TECH*tech_conf + WEIGHT_SENT*senti_conf)
+        final_pct  = _to_pct100(final_conf)
+
+        if DEBUG_SCORE:
+            print(f"   • {sym} Técnico: {tech_pct}% | Sentimento: {senti_pct}%  →  Final: {final_pct}%  (min {int(SCORE_THRESHOLD*100)}% / conf {int(MIN_CONFIDENCE*100)}%)")
+
+        # 4) gates
+        if final_conf < SCORE_THRESHOLD:
+            # perto do gatilho? coloca na prioridade do próximo ciclo
+            if final_conf >= max(0.0, SCORE_THRESHOLD - NEAR_MISS_PUSH):
+                near_miss.append(sym)
+            print(f"❌ {sym} reprovado por score final.")
+            continue
+
+        if MIN_CONFIDENCE > 0.0 and senti_conf < MIN_CONFIDENCE:
+            print(f"⛔ {sym} bloqueado por confiança (sentimento): {senti_pct}% < {int(MIN_CONFIDENCE*100)}%")
+            continue
+
+        # 5) anti-duplicado / cooldown
+        ok_to_send, reason = should_send_and_register(
+            {"symbol": sym, "entry": sig.get("entry"), "tp": sig.get("tp"), "sl": sig.get("sl")},
+            cooldown_hours=COOLDOWN_H,
+            change_threshold_pct=CHANGE_PCT,
+        )
+        if not ok_to_send:
+            print(f"⏭️ {sym} pulado ({reason}).")
+            continue
+
+        # enriquecer e aprovar
+        sig["confidence_tech"] = _to_pct01(tech_conf, 4)
+        sig["confidence_sent"] = _to_pct01(senti_conf, 4)
+        sig["confidence"]      = _to_pct01(final_conf, 4)
+        sig["created_at"]      = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        if "id" not in sig:
+            sig["id"] = f"{sym}-{int(time.time())}"
+
+        print(f"✅ {sym} aprovado ({final_pct}%), motivo: {reason}.")
+        approved.append(sig)
+
+        # 6) notificar (não trava o loop se falhar)
+        try:
+            sent = send_signal_notification({
+                "symbol": sig["symbol"],
+                "entry":  sig.get("entry"),
+                "tp":     sig.get("tp"),
+                "sl":     sig.get("sl"),
+                "risk_reward": sig.get("risk_reward", 2.0),
+                "confidence_score": _to_pct100(sig["confidence"]),
+                "strategy": (sig.get("strategy") or "RSI+MACD+EMA+BB") + "+NEWS",
+                "created_at": sig["created_at"],
+                "id": sig["id"],
+                "ai_proba": None,   # reservado p/ quando o modelo supervisionado estiver ativo
+            })
+            print("   ↪️ Notificação enviada." if sent else "   ↪️ Falha ao notificar (veja logs acima).")
+        except Exception as e:
+            print(f"   ↪️ Erro no envio Telegram: {e}")
+
+        # Politeness para News API (se necessário)
+        time.sleep(0.1)
+
+    # 7) push de prioridades (near-miss)
+    if near_miss:
+        try:
+            push_priority(near_miss)
+            print(f"📌 Empurrados para prioridade no próximo ciclo: {', '.join(near_miss)}")
+        except Exception as e:
+            print(f"⚠️ Falha ao push_priority: {e}")
+
+    # 8) persistência de sinais aprovados
+    if approved:
+        try:
+            _append_signals(SIGNALS_FILE, approved)
+            print(f"💾 {len(approved)} sinais salvos em {SIGNALS_FILE}.")
+        except Exception as e:
+            print(f"⚠️ Falha ao salvar {SIGNALS_FILE}: {e}")
+    else:
+        print("ℹ️ Nenhum sinal aprovado neste ciclo.")
+
+    end = datetime.utcnow()
+    print(f"🕒 Fim: {end:%Y-%m-%d %H:%M:%S} UTC")
+
+# ------------- Runner opcional -------------
 if __name__ == "__main__":
-    run_pipeline()
+    # Se você usa runner.py como Start Command, este bloco não roda.
+    # Mas manter aqui permite executar manualmente: python main.py
+    try:
+        run_pipeline()
+    except Exception as e:
+        print("❌ Erro no ciclo:", e)
+        traceback.print_exc()
