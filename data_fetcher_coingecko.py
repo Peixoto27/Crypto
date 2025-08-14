@@ -1,134 +1,121 @@
 # -*- coding: utf-8 -*-
 """
-data_fetcher_coingecko.py
-Coleta OHLC da CoinGecko com backoff e normalização.
-Saída de fetch_ohlc: lista de dicts [{time, open, high, low, close}, ...]
+Coleta OHLC do CoinGecko com backoff e funções utilitárias.
+- fetch_ohlc(symbol, days)  -> lista de dicts [{time, open, high, low, close}, ...]
+- fetch_top_symbols(top_n)  -> lista como ["BTCUSDT", "ETHUSDT", ...]
 """
-
 import os
 import time
 import math
 import requests
+from typing import List, Dict, Any
 
-# =========================
-# Config via ENV (mesmos nomes já usados no projeto)
-# =========================
 API_DELAY_OHLC = float(os.getenv("API_DELAY_OHLC", "12.0"))
-MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "6"))
-BACKOFF_BASE    = float(os.getenv("BACKOFF_BASE", "2.5"))
+MAX_RETRIES    = int(os.getenv("MAX_RETRIES", "6"))
+BACKOFF_BASE   = float(os.getenv("BACKOFF_BASE", "2.5"))
 
-# Mapeamento simples SYMBOL -> id da CoinGecko
-# (cobre os pares que você está usando; adicione outros se precisar)
+# Mapa símbolo -> id CoinGecko (mínimo para fallback)
 CG_IDS = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
     "BNBUSDT": "binancecoin",
     "XRPUSDT": "ripple",
     "ADAUSDT": "cardano",
-    "DOGEUSDT": "dogecoin",
     "SOLUSDT": "solana",
-    "MATICUSDT": "matic-network",
+    "DOGEUSDT": "dogecoin",
     "DOTUSDT": "polkadot",
+    "MATICUSDT": "matic-network",
     "LTCUSDT": "litecoin",
     "LINKUSDT": "chainlink",
 }
 
-SESSION = requests.Session()
-BASE = "https://api.coingecko.com/api/v3"
-
-
-def _cg_id(symbol: str) -> str:
-    """Retorna o id da CoinGecko a partir do símbolo USDT."""
-    s = (symbol or "").upper().strip()
+def _id_from_symbol(symbol: str) -> str:
+    s = (symbol or "").upper()
     if s in CG_IDS:
         return CG_IDS[s]
-    # fallback: tenta deduzir ticker (ex.: ABCUSDT -> abc)
-    guess = s.replace("USDT", "").lower()
-    # alguns ids diferem do ticker; se não soubermos, tenta o guess mesmo
-    return guess
+    # heurística simples para tentar buscar id
+    base = s.replace("USDT", "").lower()
+    return base
 
-
-def _normalize_ohlc(raw_rows):
+def fetch_ohlc(symbol: str, days: int = 14) -> List[Dict[str, Any]]:
     """
-    raw_rows: [[ts_ms, o, h, l, c], ...]
-    -> [{'time': ts_iso, 'open':..., 'high':..., 'low':..., 'close':...}, ...]
+    Busca OHLC diário (1d) no CoinGecko e normaliza para a estrutura:
+    [{time, open, high, low, close}, ...]
     """
-    out = []
-    for row in raw_rows or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 5:
-            continue
-        ts_ms, o, h, l, c = row[:5]
-        try:
-            ts_ms = int(ts_ms)
-        except Exception:
-            continue
-        # ISO UTC simples
-        ts_iso = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts_ms / 1000.0))
-        try:
-            out.append({
-                "time": ts_iso,
-                "open": float(o),
-                "high": float(h),
-                "low":  float(l),
-                "close": float(c),
-            })
-        except Exception:
-            continue
-    return out
-
-
-def fetch_ohlc(symbol: str, days: int = 14):
-    """
-    Busca candles OHLC na CoinGecko para o 'symbol' (ex.: BTCUSDT).
-    Retorna lista normalizada [{time, open, high, low, close}, ...].
-    """
-    coin_id = _cg_id(symbol)
-    url = f"{BASE}/coins/{coin_id}/ohlc"
+    coin_id = _id_from_symbol(symbol)
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
     params = {"vs_currency": "usd", "days": int(days)}
 
-    delay = API_DELAY_OHLC
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = SESSION.get(url, params=params, timeout=20)
-            # Tratamento de rate limit (429) com backoff exponencial
-            if resp.status_code == 429:
-                # retry-after se vier, senão usa backoff
-                ra = None
-                try:
-                    ra = resp.json().get("parameters", {}).get("retry_after")
-                except Exception:
-                    pass
-                wait_s = float(ra) if ra else delay
-                print(f"⚠️ 429 OHLC {coin_id}: aguardando {wait_s:.1f}s (tentativa {attempt}/{MAX_RETRIES})")
-                time.sleep(wait_s)
-                delay *= BACKOFF_BASE
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code == 429:
+                # rate limit -> backoff progressivo
+                wait = API_DELAY_OHLC if attempt == 1 else API_DELAY_OHLC * (BACKOFF_BASE ** (attempt - 1))
+                wait = min(300.0, wait)
+                print(f"⚠️ 429 OHLC {coin_id}: aguardando {round(wait,1)}s (tentativa {attempt}/{MAX_RETRIES})")
+                time.sleep(wait)
                 continue
 
-            resp.raise_for_status()
-            data = resp.json()  # lista de listas
-            norm = _normalize_ohlc(data)
-            # pausa mínima entre chamadas para respeitar uso
-            time.sleep(API_DELAY_OHLC)
-            return norm
+            r.raise_for_status()
+            raw = r.json() or []
+            # CoinGecko OHLC: [[timestamp_ms, open, high, low, close], ...]
+            out = []
+            for row in raw:
+                if not isinstance(row, list) or len(row) < 5:
+                    continue
+                out.append({
+                    "time": int(row[0]) // 1000,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low":  float(row[3]),
+                    "close":float(row[4]),
+                })
+            return out
 
-        except requests.exceptions.RequestException as e:
-            # 400 comuns quando o id não bate ou sem dados suficientes
-            print(f"⚠️ Erro OHLC {coin_id}: {e} (tentativa {attempt}/{MAX_RETRIES})")
-            time.sleep(delay)
-            delay *= BACKOFF_BASE
         except Exception as e:
-            print(f"⚠️ Erro inesperado OHLC {coin_id}: {e} (tentativa {attempt}/{MAX_RETRIES})")
-            time.sleep(delay)
-            delay *= BACKOFF_BASE
+            if attempt >= MAX_RETRIES:
+                raise
+            wait = API_DELAY_OHLC if attempt == 1 else API_DELAY_OHLC * (BACKOFF_BASE ** (attempt - 1))
+            wait = min(300.0, wait)
+            print(f"⚠️ Erro OHLC {coin_id}: {e} -> aguardando {round(wait,1)}s (tentativa {attempt}/{MAX_RETRIES})")
+            time.sleep(wait)
 
-    # chegou aqui: falhou
     return []
 
 
-def fetch_prices_bulk(symbols):
+def fetch_top_symbols(top_n: int = 50) -> List[str]:
     """
-    Opcional: retorna um dicionário simples com 'symbol' -> None.
-    Mantido por compatibilidade se o main chamar isso.
+    Retorna uma lista de tickers no formato *USDT* (ex.: BTCUSDT, ETHUSDT).
+    Usa /coins/markets (market cap desc). Dedup e corta em top_n.
     """
-    # Caso precise implementar, pode usar /simple/price, mas para o pipeline atual não é requerido.
-    return {s: None for s in symbols or []}
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": min(max(int(top_n), 1), 250),
+            "page": 1,
+            "sparkline": "false"
+        }
+        r = requests.get(url, params=params, timeout=25)
+        r.raise_for_status()
+        rows = r.json() or []
+
+        out: List[str] = []
+        for it in rows:
+            sym = (it.get("symbol") or "").upper()
+            if sym and sym.isalpha():
+                out.append(f"{sym}USDT")
+
+        seen = set()
+        dedup = []
+        for s in out:
+            if s not in seen:
+                seen.add(s)
+                dedup.append(s)
+        return dedup[:top_n]
+
+    except Exception as e:
+        print(f"⚠️ fetch_top_symbols falhou: {e}")
+        return ["BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","ADAUSDT","SOLUSDT","DOGEUSDT","DOTUSDT","MATICUSDT","LTCUSDT","LINKUSDT"]
