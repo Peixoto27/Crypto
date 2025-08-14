@@ -1,219 +1,245 @@
 # -*- coding: utf-8 -*-
-"""
-main.py — pipeline completo com fast-lane + rotação
-- Seleciona símbolos (fixos + rotação)
-- Coleta OHLC (CoinGecko)
-- Gera sinal técnico (signal_generator)
-- Agrega sentimento (sentiment_analyzer)
-- Filtra por SCORE_THRESHOLD e MIN_CONFIDENCE
-- Evita duplicados (positions_manager)
-- Notifica Telegram (notifier_telegram)
-"""
+# main.py — pipeline principal (com normalização de OHLC)
 
 import os
 import json
 import time
-import traceback
 from datetime import datetime
 
-# -------- dependências do seu projeto --------
-from symbol_rotator import get_next_batch, push_priority
-from coingecko_client import fetch_ohlc                     # retorna candles [{open,high,low,close,ts}, ...]
-from signal_generator import generate_signal                # retorna dict com confidence (técnico) + entry/tp/sl
-from sentiment_analyzer import get_sentiment_score          # retorna polaridade [-1..1]
-from positions_manager import should_send_and_register
+from coingecko_client import fetch_ohlc
+from apply_strategies import generate_signal, score_signal
 from notifier_telegram import send_signal_notification
+from positions_manager import should_send_and_register
 
-# ------------- parâmetros por ENV -------------
-DAYS_OHLC        = int(os.getenv("DAYS_OHLC", "14"))
-SCORE_THRESHOLD  = float(os.getenv("SCORE_THRESHOLD", os.getenv("MIN_CONFIDENCE", "0.70")))  # corte final
-MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.70"))  # gate do sentimento (0.0 para desativar)
-WEIGHT_TECH      = float(os.getenv("WEIGHT_TECH", "0.8"))
-WEIGHT_SENT      = float(os.getenv("WEIGHT_SENT", "0.2"))
-COOLDOWN_H       = float(os.getenv("COOLDOWN_HOURS", "6"))
-CHANGE_PCT       = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
-NEAR_MISS_PUSH   = float(os.getenv("NEAR_MISS_PUSH", "0.05"))   # se final ∈ [SCORE_THRESHOLD-NEAR_MISS_PUSH, SCORE_THRESHOLD), empurra p/ prioridade
-DATA_RAW_FILE    = os.getenv("DATA_RAW_FILE", "data_raw.json")
-SIGNALS_FILE     = os.getenv("SIGNALS_FILE", "signals.json")
-DEBUG_SCORE      = os.getenv("DEBUG_SCORE", "True").lower() in ("1", "true", "yes")
+# =======================
+# Config via Environment
+# =======================
+SYMBOLS = os.getenv(
+    "SYMBOLS",
+    "BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,SOLUSDT,DOGEUSDT,DOTUSDT,MATICUSDT,LTCUSDT,LINKUSDT"
+).replace(" ", "").split(",")
 
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
+DAYS_OHLC        = int(os.getenv("DAYS_OHLC", "14"))    # janelas de OHLC por símbolo
+SCORE_THRESHOLD  = float(os.getenv("SCORE_THRESHOLD", "0.70"))
+MIN_CONFIDENCE   = float(os.getenv("MIN_CONFIDENCE", "0.60"))   # filtro final de “confiança” do sinal
+SELECT_PER_CYCLE = int(os.getenv("SELECT_PER_CYCLE", str(len(SYMBOLS))))  # quantos por ciclo
+EXTRA_INDICATORS_LOG = os.getenv("EXTRA_INDICATORS_LOG", "0") == "1"
 
-def _to_pct01(x, digits=2):
+# anti-duplicado
+COOLDOWN_HOURS     = float(os.getenv("COOLDOWN_HOURS", "6"))
+CHANGE_THRESHOLD_PCT = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
+
+DATA_RAW_FILE = "data_raw.json"
+SIGNALS_FILE  = "signals.json"
+
+# ===============
+# Util / Helpers
+# ===============
+def _ts():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def normalize_ohlc(ohlc_raw):
+    """
+    Padroniza OHLC em lista de dicts:
+    [{time, open, high, low, close}, ...]
+    Aceita:
+      - lista de listas [t, o, h, l, c]
+      - lista de dicts com chaves open/high/low/close (opcionalmente t/time)
+    """
+    if not ohlc_raw:
+        return []
+
+    first = ohlc_raw[0]
+
+    # Caso CoinGecko: lista de listas [time, open, high, low, close]
+    if isinstance(first, (list, tuple)) and len(first) >= 5:
+        out = []
+        for c in ohlc_raw:
+            try:
+                out.append({
+                    "time": int(c[0]),
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low":  float(c[3]),
+                    "close":float(c[4]),
+                })
+            except Exception:
+                # se alguma linha vier quebrada, ignora
+                continue
+        return out
+
+    # Já no formato dict
+    if isinstance(first, dict):
+        out = []
+        for c in ohlc_raw:
+            try:
+                # aceita variações de chave de tempo
+                t = c.get("time", c.get("t", 0))
+                out.append({
+                    "time": int(t) if t is not None else 0,
+                    "open": float(c["open"]),
+                    "high": float(c["high"]),
+                    "low":  float(c["low"]),
+                    "close":float(c["close"]),
+                })
+            except Exception:
+                continue
+        return out
+
+    # formato inesperado
+    return []
+
+
+def save_json(path, obj):
     try:
-        return round(float(x), digits)
-    except Exception:
-        return x
-
-def _to_pct100(x, digits=1):
-    try:
-        return round(float(x)*100.0, digits)
-    except Exception:
-        return x
-
-def _save_json(path, obj):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-def _append_signals(path, items):
-    existing = []
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except Exception:
-            existing = []
-    existing.extend(items)
-    _save_json(path, existing)
-
-def run_pipeline():
-    start = datetime.utcnow()
-    print(f"🕒 Início: {start:%Y-%m-%d %H:%M:%S} UTC")
-
-    # -------- seleção de símbolos (fast-lane + rotação + prioridade) --------
-    try:
-        selected = get_next_batch()
-        print(f"✅ Selecionados (fast-lane + rotação): {', '.join(selected)}")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"⚠️ Rotator falhou: {e}. Abortando ciclo para evitar 429 desnecessário.")
+        print(f"⚠️ Falha ao salvar {path}: {e}")
+
+
+def append_signal(sig: dict):
+    try:
+        existing = []
+        if os.path.exists(SIGNALS_FILE):
+            with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        existing.append(sig)
+        save_json(SIGNALS_FILE, existing)
+    except Exception as e:
+        print(f"⚠️ Falha ao registrar em {SIGNALS_FILE}: {e}")
+
+
+# =================
+# Pipeline principal
+# =================
+def run_pipeline():
+    print("🧩 Coletando PREÇOS / OHLC…")
+    collected = {}
+    ok_symbols = []
+
+    # Seleciona subset por ciclo, se configurado
+    selected = SYMBOLS[:max(1, SELECT_PER_CYCLE)]
+
+    for sym in selected:
+        print(f"📊 Coletando OHLC {sym} (days={DAYS_OHLC})…")
+        try:
+            raw = fetch_ohlc(sym, DAYS_OHLC)  # pode retornar lista de listas ou de dicts
+            ohlc = normalize_ohlc(raw)
+            if len(ohlc) < 30:
+                print(f"   → ❌ Dados insuficientes para {sym}")
+                continue
+            collected[sym] = ohlc
+            ok_symbols.append(sym)
+            print(f"   → OK | candles={len(ohlc)}")
+        except Exception as e:
+            print(f"⚠️ Erro OHLC {sym}: {e}")
+
+    if not ok_symbols:
+        print("❌ Nenhum ativo com OHLC suficiente.")
         return
 
-    # -------- coleta OHLC --------
-    data_raw = {}
-    for sym in selected:
-        try:
-            print(f"📊 Coletando OHLC {sym} (days={DAYS_OHLC})…")
-            candles = fetch_ohlc(sym, days=DAYS_OHLC)
-            if not candles or len(candles) < 40:
-                print(f"⚠️ {sym}: dados insuficientes ({0 if not candles else len(candles)})")
-                continue
-            data_raw[sym] = candles
-        except Exception as e:
-            print(f"⚠️ {sym}: falha ao coletar OHLC: {e}")
-
+    # salva crú (debug/telemetria)
     try:
-        _save_json(DATA_RAW_FILE, data_raw)
-        print(f"💾 Salvo {DATA_RAW_FILE} ({len(data_raw)} ativos).")
+        save_json(DATA_RAW_FILE, {k: v[-120:] for k, v in collected.items()})
+        print(f"💾 Salvo {DATA_RAW_FILE} ({len(collected)} ativos)")
     except Exception as e:
         print(f"⚠️ Falha ao salvar {DATA_RAW_FILE}: {e}")
 
-    # -------- geração + avaliação de sinais --------
-    approved = []
-    near_miss = []
+    saved_count = 0
 
-    for sym, candles in data_raw.items():
-        # 1) sinal técnico
-        sig = None
+    for sym in ok_symbols:
+        ohlc = collected[sym]
+        closes = [c["close"] for c in ohlc]
+
+        # score técnico (0..1) vindo do apply_strategies.score_signal
         try:
-            sig = generate_signal(sym, candles)
+            sc = score_signal(closes)  # pode retornar None
+        except Exception as e:
+            print(f"⚠️ {sym}: erro em score_signal: {e}")
+            sc = None
+
+        shown = "None" if sc is None else f"{round(sc*100,1)}%"
+        print(f"ℹ️ Score {sym}: {shown} (min {int(SCORE_THRESHOLD*100)}%)")
+
+        if sc is None or sc < SCORE_THRESHOLD:
+            continue
+
+        # gera plano de trade com os mesmos candles (NORMALIZADOS)
+        try:
+            sig = generate_signal(sym, ohlc)  # deve devolver dict com entry/tp/sl/confidence/strategy...
+        except TypeError:
+            # se sua implementação antiga esperava apenas closes, tenta fallback
+            try:
+                sig = generate_signal(sym, [{"close": c} for c in closes])
+            except Exception as e:
+                print(f"⚠️ {sym}: erro em generate_signal (fallback): {e}")
+                sig = None
         except Exception as e:
             print(f"⚠️ {sym}: erro em generate_signal: {e}")
+            sig = None
 
-        if sig is None:
-            print(f"ℹ️ {sym}: sem sinal técnico.")
+        if not sig:
+            print(f"⚠️ {sym}: sem sinal técnico.")
             continue
 
-        tech_conf = float(sig.get("confidence", 0.0))          # [0..1]
-        tech_pct  = _to_pct100(tech_conf)
-
-        # 2) sentimento → normaliza para [0..1]
+        # normaliza campos esperados
+        sig["symbol"] = sym
+        sig["created_at"] = _ts()
+        # se confiança vier 0..1, converte para 0..1; se vier em %, normaliza
+        conf = sig.get("confidence", sc)
         try:
-            senti_raw = float(get_sentiment_score(sym))         # [-1..1]
-        except Exception as e:
-            print(f"⚠️ Sentimento falhou para {sym}: {e}")
-            senti_raw = 0.0
-        senti_conf = _clamp01((senti_raw + 1.0) / 2.0)         # [0..1]
-        senti_pct  = _to_pct100(senti_conf)
+            conf = float(conf)
+            if conf > 1.0:  # chegou em porcentagem
+                conf = conf / 100.0
+        except Exception:
+            conf = sc
+        sig["confidence"] = conf
 
-        # 3) combinação final
-        final_conf = _clamp01(WEIGHT_TECH*tech_conf + WEIGHT_SENT*senti_conf)
-        final_pct  = _to_pct100(final_conf)
-
-        if DEBUG_SCORE:
-            print(f"   • {sym} Técnico: {tech_pct}% | Sentimento: {senti_pct}%  →  Final: {final_pct}%  (min {int(SCORE_THRESHOLD*100)}% / conf {int(MIN_CONFIDENCE*100)}%)")
-
-        # 4) gates
-        if final_conf < SCORE_THRESHOLD:
-            # perto do gatilho? coloca na prioridade do próximo ciclo
-            if final_conf >= max(0.0, SCORE_THRESHOLD - NEAR_MISS_PUSH):
-                near_miss.append(sym)
-            print(f"❌ {sym} reprovado por score final.")
+        if conf < MIN_CONFIDENCE:
+            print(f"⛔ {sym} descartado (<{int(MIN_CONFIDENCE*100)}%)")
             continue
 
-        if MIN_CONFIDENCE > 0.0 and senti_conf < MIN_CONFIDENCE:
-            print(f"⛔ {sym} bloqueado por confiança (sentimento): {senti_pct}% < {int(MIN_CONFIDENCE*100)}%")
-            continue
-
-        # 5) anti-duplicado / cooldown
-        ok_to_send, reason = should_send_and_register(
-            {"symbol": sym, "entry": sig.get("entry"), "tp": sig.get("tp"), "sl": sig.get("sl")},
-            cooldown_hours=COOLDOWN_H,
-            change_threshold_pct=CHANGE_PCT,
+        # anti-duplicado / cooldown
+        ok_to_send, why = should_send_and_register(
+            {
+                "symbol": sym,
+                "entry": sig.get("entry"),
+                "tp":    sig.get("tp"),
+                "sl":    sig.get("sl"),
+            },
+            cooldown_hours=COOLDOWN_HOURS,
+            change_threshold_pct=CHANGE_THRESHOLD_PCT,
         )
+
         if not ok_to_send:
-            print(f"⏭️ {sym} pulado ({reason}).")
+            print(f"🟡 {sym} pulado (duplicado: {why}).")
             continue
 
-        # enriquecer e aprovar
-        sig["confidence_tech"] = _to_pct01(tech_conf, 4)
-        sig["confidence_sent"] = _to_pct01(senti_conf, 4)
-        sig["confidence"]      = _to_pct01(final_conf, 4)
-        sig["created_at"]      = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        if "id" not in sig:
-            sig["id"] = f"{sym}-{int(time.time())}"
+        # envia para Telegram
+        pushed = send_signal_notification({
+            "symbol": sym,
+            "entry_price": sig.get("entry"),
+            "target_price": sig.get("tp"),
+            "stop_loss": sig.get("sl"),
+            "risk_reward": sig.get("rr", 2.0),
+            "confidence_score": round(conf*100, 2),
+            "strategy": sig.get("strategy", "RSI+MACD+EMA+BB"),
+            "created_at": sig.get("created_at", _ts()),
+            "id": f"{sym}-{int(time.time())}",
+        })
 
-        print(f"✅ {sym} aprovado ({final_pct}%), motivo: {reason}.")
-        approved.append(sig)
+        if pushed:
+            print("✅ Notificação enviada.")
+        else:
+            print("❌ Falha no envio (ver notifier_telegram).")
 
-        # 6) notificar (não trava o loop se falhar)
-        try:
-            sent = send_signal_notification({
-                "symbol": sig["symbol"],
-                "entry":  sig.get("entry"),
-                "tp":     sig.get("tp"),
-                "sl":     sig.get("sl"),
-                "risk_reward": sig.get("risk_reward", 2.0),
-                "confidence_score": _to_pct100(sig["confidence"]),
-                "strategy": (sig.get("strategy") or "RSI+MACD+EMA+BB") + "+NEWS",
-                "created_at": sig["created_at"],
-                "id": sig["id"],
-                "ai_proba": None,   # reservado p/ quando o modelo supervisionado estiver ativo
-            })
-            print("   ↪️ Notificação enviada." if sent else "   ↪️ Falha ao notificar (veja logs acima).")
-        except Exception as e:
-            print(f"   ↪️ Erro no envio Telegram: {e}")
+        append_signal(sig)
+        saved_count += 1
 
-        # Politeness para News API (se necessário)
-        time.sleep(0.1)
+    print(f"💾 {saved_count} sinais salvos em {SIGNALS_FILE}")
+    print(f"🕒 Fim: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-    # 7) push de prioridades (near-miss)
-    if near_miss:
-        try:
-            push_priority(near_miss)
-            print(f"📌 Empurrados para prioridade no próximo ciclo: {', '.join(near_miss)}")
-        except Exception as e:
-            print(f"⚠️ Falha ao push_priority: {e}")
 
-    # 8) persistência de sinais aprovados
-    if approved:
-        try:
-            _append_signals(SIGNALS_FILE, approved)
-            print(f"💾 {len(approved)} sinais salvos em {SIGNALS_FILE}.")
-        except Exception as e:
-            print(f"⚠️ Falha ao salvar {SIGNALS_FILE}: {e}")
-    else:
-        print("ℹ️ Nenhum sinal aprovado neste ciclo.")
-
-    end = datetime.utcnow()
-    print(f"🕒 Fim: {end:%Y-%m-%d %H:%M:%S} UTC")
-
-# ------------- Runner opcional -------------
 if __name__ == "__main__":
-    # Se você usa runner.py como Start Command, este bloco não roda.
-    # Mas manter aqui permite executar manualmente: python main.py
-    try:
-        run_pipeline()
-    except Exception as e:
-        print("❌ Erro no ciclo:", e)
-        traceback.print_exc()
+    run_pipeline()
