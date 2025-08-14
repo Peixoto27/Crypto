@@ -1,41 +1,35 @@
 # -*- coding: utf-8 -*-
-import json
-import os
-import time
-from datetime import datetime
+import os, json
+from typing import Dict, Any, List
 
-HISTORY_FILE = "history.json"
+HISTORY_FILE = os.getenv("HISTORY_FILE", "history.json")
 
-def load_history():
-    """Carrega histórico salvo do arquivo"""
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            print("⚠️ Erro ao ler history.json, recriando arquivo.")
-            return []
-    return []
+def _ensure_file(path: str, default):
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(default, f, ensure_ascii=False, indent=2)
 
-def save_history(data):
-    """Salva lista de sinais no arquivo"""
+_ensure_file(HISTORY_FILE, [])  # lista de fechamentos
+
+def load_history() -> List[Dict[str, Any]]:
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_history(rows: List[Dict[str, Any]]) -> None:
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(rows, f, ensure_ascii=False, indent=2)
 
-def append_to_history(signal_data):
+def append_history(event: Dict[str, Any]) -> None:
     """
-    Adiciona um novo registro ao histórico.
-    signal_data deve conter:
-      - symbol
-      - timestamp
-      - indicadores (RSI, MACD, EMA20, EMA50, BB_up, BB_mid, BB_low)
-      - score
-      - decisão (enviado ou não)
-      - resultado (tp/hit_stop/pendente) — inicialmente 'pendente'
+    event = {
+      "symbol": "BTCUSDT", "result": "hit_tp|hit_sl|expirado",
+      "entry": float, "tp": float, "sl": float,
+      "exit_price": float, "created_at": "...", "closed_at": "...", "id": "..."
+    }
     """
-    history = load_history()
-    signal_data["recorded_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    signal_data["result"] = "pendente"  # vamos atualizar depois
-    history.append(signal_data)
-    save_history(history)
-    print(f"💾 Histórico atualizado ({len(history)} registros).")
+    data = load_history()
+    data.append(event)
+    save_history(data)
