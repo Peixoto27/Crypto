@@ -1,217 +1,327 @@
 # -*- coding: utf-8 -*-
 """
-signal_generator.py — motor de sinal técnico
-- RSI + MACD + EMA20/EMA50 + Bollinger
-- Plano de trade (entry/tp/sl) baseado em volatilidade recente
-- Extras passivos (Stochastic, Ichimoku, PSAR) para debug (não afetam o score)
+signal_generator.py
+Gera score e sinal usando indicadores técnicos (básicos + extras) e, opcionalmente,
+um peso de sentimento de notícias.
 
-Espera candles no formato:
-[{"open": float, "high": float, "low": float, "close": float, "ts": int}, ...]
+Requisitos que já existem no seu projeto:
+- indicators.py  -> rsi, macd, ema, bollinger
+- indicators_extra.py -> ichimoku, parabolic_sar, stochastic, vwap, obv   (se não existir, o módulo é ignorado)
+- sentiment_analyzer.py -> get_sentiment_score(symbol)  (opcional)
+- config/env via os.getenv (Railway Variables)
+
+Retornos:
+- score_signal(closes): float entre 0..1 (ou None se dados insuficientes)
+- generate_signal(symbol, candles): dict com o sinal OU None
+
+Observações:
+- Tolerante: aceita 1 confirmação se o score já for alto; exige 2+ confirmações quando o score está “no limite”.
+- Evita indexação inválida quando algum indicador retorna None.
 """
 
-import os
-import statistics
 from statistics import fmean
-from typing import Dict, List, Optional, Tuple
+import os
+import time
 
-from indicators import rsi, macd, ema, bollinger  # já existentes no seu projeto
-# extras passivos (arquivo indicators_extra.py)
+# ------------------------------
+# Config (via ENV)
+# ------------------------------
+SCORE_THRESHOLD   = float(os.getenv("SCORE_THRESHOLD", "0.70"))   # nota mínima do score (0..1)
+MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.60"))    # confiança mínima do sinal (0..1)
+EXTRA_SCORE_WEIGHT= float(os.getenv("EXTRA_SCORE_WEIGHT", "0.0")) # peso de extras (0..1) no score
+WEIGHT_SENT       = float(os.getenv("WEIGHT_SENT", "0.0"))        # peso de sentimento (-1..1) -> ajusta score
+EXTRA_LOG         = os.getenv("EXTRA_INDICATORS_LOG", "0") == "1"
+
+# Parametrizações do plano (TP/SL) e dados
+ATR_LOOKBACK      = int(os.getenv("ATR_LOOKBACK", "15"))          # pseudo-ATR por diferenças
+RISK_RR_TP        = float(os.getenv("RISK_RR_TP", "2.0"))         # alvo = 2x “faixa média”
+RISK_RR_SL        = float(os.getenv("RISK_RR_SL", "1.0"))         # stop = 1x “faixa média”
+
+# ------------------------------
+# Imports internos do projeto
+# ------------------------------
+from indicators import rsi, macd, ema, bollinger
+
+# Módulos extras opcionais
 try:
-    from indicators_extra import stochastic_kd, ichimoku, parabolic_sar  # opcional
+    from indicators_extra import ichimoku, parabolic_sar, stochastic, vwap, obv
+    HAS_EXTRAS = True
 except Exception:
-    stochastic_kd = ichimoku = parabolic_sar = None
+    HAS_EXTRAS = False
 
-# =========================
-# Parâmetros por ENV
-# =========================
-# limite mínimo para considerar score (o corte REAL é feito no main via MIN_CONFIDENCE/SCORE_THRESHOLD)
-MIN_LOCAL_SCORE = float(os.getenv("MIN_LOCAL_SCORE", "0.0"))
+# Sentimento opcional
+try:
+    from sentiment_analyzer import get_sentiment_score
+    HAS_SENTIMENT = True
+except Exception:
+    HAS_SENTIMENT = False
 
-# pesos internos do score técnico (somam ~1.0)
-W_RSI   = float(os.getenv("W_RSI",   "0.25"))
-W_MACD  = float(os.getenv("W_MACD",  "0.30"))
-W_TREND = float(os.getenv("W_TREND", "0.25"))
-W_BB    = float(os.getenv("W_BB",    "0.20"))
 
-# plano de trade
-RISK_R  = float(os.getenv("RISK_R", "2.0"))  # relação TP:SL ~2:1
-ATR_WIN = int(os.getenv("ATR_WIN", "15"))    # janela do "ATR-like"
+# ------------------------------
+# Utilidades
+# ------------------------------
+def _last_safe(seq, i):
+    """Retorna seq[i] caso exista e não seja None, senão None."""
+    try:
+        v = seq[i]
+        return v if v is not None else None
+    except Exception:
+        return None
 
-# extras/log
-EXTRA_LOG = os.getenv("EXTRA_INDICATORS_LOG", "0") == "1"
-EXTRA_W   = float(os.getenv("EXTRA_SCORE_WEIGHT", "0.0"))  # mantenha 0.0 (não somar ao score)
+def _build_trade_plan(closes, risk_ratio_tp=RISK_RR_TP, risk_ratio_sl=RISK_RR_SL):
+    """Plano simples usando um 'ATR-like' baseado na média das variações recentes."""
+    if len(closes) < max(ATR_LOOKBACK + 1, 20):
+        return None
+    last = float(closes[-1])
+    diffs = [abs(closes[j] - closes[j-1]) for j in range(len(closes) - ATR_LOOKBACK, len(closes))]
+    atr_like = fmean(diffs) if diffs else 0.0
+    if atr_like <= 0:
+        return None
+    sl = last - (atr_like * risk_ratio_sl)
+    tp = last + (atr_like * risk_ratio_tp)
+    return {"entry": last, "tp": tp, "sl": sl}
 
-# =========================
-# Helpers
-# =========================
-def _last(values: List[Optional[float]]) -> Optional[float]:
-    return None if not values else values[-1]
 
-def _atr_like(closes: List[float], win: int) -> float:
-    diffs = [abs(closes[i] - closes[i-1]) for i in range(1, len(closes))]
-    recent = diffs[-win:] if len(diffs) >= win else diffs
-    return statistics.fmean(recent) if recent else 0.0
+# ------------------------------
+# Score (0..1)
+# ------------------------------
+def score_signal(closes):
+    """Calcula um score agregando RSI, MACD, EMAs e Bandas de Bollinger (+ extras opcionais)."""
+    if not closes or len(closes) < 60:
+        return None
 
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
+    i = len(closes) - 1
+    c = float(closes[i])
 
-# =========================
-# Score técnico
-# =========================
-def _score_components(closes: List[float]) -> Tuple[float, Dict[str, float], Dict[str, float]]:
-    """
-    Retorna:
-      score (0..1),
-      subscores {"rsi":..,"macd":..,"trend":..,"bb":..},
-      debug     {"r":..,"macd_hist":..,"ema20":..,"ema50":..,"bb_low":..,"close":..}
-    """
-    n = len(closes)
-    if n < 60:
-        return 0.0, {}, {}
-
-    # indicadores base
-    r_arr = rsi(closes, 14)
+    # --- indicadores básicos ---
+    r = rsi(closes, 14)                              # lista
     macd_line, signal_line, hist = macd(closes, 12, 26, 9)
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
     bb_up, bb_mid, bb_low = bollinger(closes, 20, 2.0)
 
-    i  = n - 1
-    c  = closes[i]
-    r_ = r_arr[i] if r_arr[i] is not None else 50.0
+    r_i       = _last_safe(r, i)
+    macd_i    = _last_safe(macd_line, i)
+    macdsig_i = _last_safe(signal_line, i)
+    hist_i    = _last_safe(hist, i)
+    ema20_i   = _last_safe(ema20, i)
+    ema50_i   = _last_safe(ema50, i)
+    bb_low_i  = _last_safe(bb_low, i)
 
-    # heurísticas
-    is_rsi_bull   = 45 <= r_ <= 65
-    is_macd_cross = (macd_line[i] is not None and signal_line[i] is not None and
-                     macd_line[i] > signal_line[i] and macd_line[i-1] <= signal_line[i-1])
-    is_trend_up   = (ema20[i] is not None and ema50[i] is not None and ema20[i] > ema50[i])
-    near_bb_low   = (bb_low[i] is not None and c <= bb_low[i] * 1.01)
+    # Sinais básicos (booleans)
+    is_rsi_bull   = (r_i is not None) and (45 <= r_i <= 65)
+    is_macd_cross = (macd_i is not None and macdsig_i is not None and
+                     macd_i > macdsig_i and _last_safe(macd_line, i-1) is not None and _last_safe(signal_line, i-1) is not None and
+                     macd_line[i-1] <= signal_line[i-1])
+    is_trend_up   = (ema20_i is not None and ema50_i is not None and ema20_i > ema50_i)
+    near_bb_low   = (bb_low_i is not None and c <= bb_low_i * 1.01)
 
-    # subscores [0..1]
-    s_rsi   = 1.0 if is_rsi_bull else (0.6 if 40 <= r_ <= 70 else 0.0)
-    s_macd  = 1.0 if is_macd_cross else (0.7 if (hist[i] is not None and hist[i] > 0) else 0.2)
+    # Notas parciais
+    s_rsi   = 1.0 if is_rsi_bull else (0.6 if (r_i is not None and 40 <= r_i <= 70) else 0.0)
+    s_macd  = 1.0 if is_macd_cross else (0.7 if (hist_i is not None and hist_i > 0) else 0.2)
     s_trend = 1.0 if is_trend_up else 0.3
     s_bb    = 1.0 if near_bb_low else 0.5
 
-    # média ponderada
-    score = (W_RSI*s_rsi + W_MACD*s_macd + W_TREND*s_trend + W_BB*s_bb) / max(
-        W_RSI + W_MACD + W_TREND + W_BB, 1e-9
-    )
+    parts = [s_rsi, s_macd, s_trend, s_bb]
 
-    # leve normalização por volatilidade do MACD
-    recent_hist = [abs(h) for h in hist[-20:] if h is not None]
-    if recent_hist:
-        vol_boost = _clamp01(abs(hist[i]) / (max(recent_hist) + 1e-9))
-        score = 0.85*score + 0.15*vol_boost
+    # --- extras opcionais (dão um plus no score) ---
+    extras_used = []
+    if HAS_EXTRAS and EXTRA_SCORE_WEIGHT > 0.0:
+        try:
+            # Ichimoku (kumo / linha de base)
+            ich = ichimoku(closes)  # deve retornar dict com chaves, ou tupla; aqui checamos no "modo simples"
+            ich_bull = False
+            if isinstance(ich, dict):
+                # critérios simples: preço acima da nuvem e/ou kijun acima de tenkan
+                cloud_top = ich.get("spanA")[-1] if ich.get("spanA") else None
+                cloud_bot = ich.get("spanB")[-1] if ich.get("spanB") else None
+                kijun     = ich.get("kijun")[-1]  if ich.get("kijun") else None
+                tenkan    = ich.get("tenkan")[-1] if ich.get("tenkan") else None
+                if cloud_top is not None and cloud_bot is not None:
+                    above_cloud = c > max(cloud_top, cloud_bot)
+                else:
+                    above_cloud = False
+                ich_bull = (above_cloud or (kijun is not None and tenkan is not None and kijun >= tenkan))
+            extras_used.append(1.0 if ich_bull else 0.0)
 
-    subs = {"rsi": round(s_rsi, 4), "macd": round(s_macd, 4), "trend": round(s_trend, 4), "bb": round(s_bb, 4)}
-    dbg  = {
-        "r": round(r_, 2),
-        "macd_hist": None if hist[i] is None else round(hist[i], 6),
-        "ema20": None if ema20[i] is None else round(ema20[i], 6),
-        "ema50": None if ema50[i] is None else round(ema50[i], 6),
-        "bb_low": None if bb_low[i] is None else round(bb_low[i], 6),
-        "close": round(c, 6),
-    }
+            # SAR parabólico (tendência de alta quando preço acima do SAR)
+            sar_vals = parabolic_sar(closes)
+            sar_i = _last_safe(sar_vals, i)
+            extras_used.append(1.0 if (sar_i is not None and c > sar_i) else 0.0)
 
-    return _clamp01(score), subs, dbg
+            # Stochastic (saída de sobrevenda)
+            k, d = stochastic(closes, 14, 3)
+            k_i = _last_safe(k, i); d_i = _last_safe(d, i)
+            stoch_bull = (k_i is not None and d_i is not None and
+                          k_i > d_i and k_i < 50)  # cruzado para cima em região inferior
+            extras_used.append(1.0 if stoch_bull else 0.0)
 
-# =========================
-# Plano de trade
-# =========================
-def _build_trade_plan(closes: List[float], rr: float = RISK_R) -> Optional[Dict[str, float]]:
-    if len(closes) < 30:
-        return None
-    last = closes[-1]
-    atrl = _atr_like(closes, ATR_WIN)
-    if atrl <= 0:
-        return None
-    sl = last - (atrl * 1.0)
-    tp = last + (atrl * rr)
-    return {"entry": last, "tp": tp, "sl": sl}
+            # VWAP (preço acima do VWAP)
+            vwap_vals = vwap(closes)
+            vwap_i = _last_safe(vwap_vals, i)
+            extras_used.append(1.0 if (vwap_i is not None and c >= vwap_i) else 0.0)
 
-# =========================
-# API principal
-# =========================
-def generate_signal(symbol: str, candles: List[Dict]) -> Optional[Dict]:
+            # OBV (só se função existir — algumas impl. precisam de volumes)
+            try:
+                obv_vals = obv(closes)
+                # tendência de alta simplificada: OBV crescente nas últimas barras
+                obv_up = False
+                if obv_vals and len(obv_vals) >= 3:
+                    obv_up = obv_vals[-1] > obv_vals[-2] > obv_vals[-3]
+                extras_used.append(1.0 if obv_up else 0.0)
+            except Exception:
+                pass
+
+        except Exception as e:
+            if EXTRA_LOG:
+                print(f"⚠️  Extras falharam: {e}")
+
+    # score base
+    base_score = fmean(parts)
+
+    # complementa com extras (se houver)
+    if extras_used:
+        extras_avg = fmean(extras_used)
+        base_score = (1 - EXTRA_SCORE_WEIGHT) * base_score + EXTRA_SCORE_WEIGHT * extras_avg
+
+    # leve normalização por volatilidade do hist do MACD (quando existir)
+    try:
+        recent = [abs(h) for h in hist[-20:] if h is not None]
+        if recent:
+            hist_i_abs = abs(hist_i) if hist_i is not None else 0.0
+            vol_boost = max(0.0, min(hist_i_abs / (max(recent) + 1e-9), 1.0))
+            base_score = 0.85 * base_score + 0.15 * vol_boost
+    except Exception:
+        pass
+
+    # sentimento (se existir) – transforma [-1..1] em ajuste no score
+    if HAS_SENTIMENT and WEIGHT_SENT != 0.0:
+        try:
+            # Aqui não temos o símbolo; o ajuste final será feito no generate_signal
+            # Mantemos somente base_score aqui.
+            pass
+        except Exception:
+            pass
+
+    # clamp
+    base_score = max(0.0, min(1.0, base_score))
+    return base_score
+
+
+# ------------------------------
+# Sinal
+# ------------------------------
+def generate_signal(symbol, candles):
     """
-    Retorna um dict de sinal:
-      {
-        symbol, timestamp, confidence, entry, tp, sl, strategy,
-        debug: {...}, source: "coingecko"
-      }
-    ou None se não há condições mínimas.
+    Gera um sinal para o símbolo dado um array de candles (cada candle = dict com 'close').
+    Aplica:
+      - score >= SCORE_THRESHOLD
+      - confirmações flexíveis (3/2/1) de indicadores básicos
+      - plano (entry/tp/sl)
+      - sentimento opcional para ajustar confiança
     """
     if not candles or len(candles) < 60:
+        if EXTRA_LOG:
+            print(f"{symbol}: poucos candles ({len(candles) if candles else 0})")
         return None
 
-    closes = [float(c["close"]) for c in candles]
-    highs  = [float(c["high"])  for c in candles]
-    lows   = [float(c["low"])   for c in candles]
+    closes = [float(c.get("close")) for c in candles if "close" in c]
 
-    # score técnico base
-    tech_score, subs, dbg = _score_components(closes)
-    if tech_score < MIN_LOCAL_SCORE:
+    sc = score_signal(closes)
+    if sc is None:
+        if EXTRA_LOG:
+            print(f"{symbol}: score None (dados insuficientes).")
         return None
 
-    # extras passivos (apenas logs)
-    extras = {}
-    if EXTRA_LOG:
-        try:
-            if stochastic_kd:
-                k, d = stochastic_kd(highs, lows, closes, 14, 3, 3)
-                extras["stoch_k"] = None if _last(k) is None else round(_last(k), 2)
-                extras["stoch_d"] = None if _last(d) is None else round(_last(d), 2)
-            if ichimoku:
-                tenkan, kijun, span_a, span_b = ichimoku(highs, lows)
-                extras["ichimoku"] = {
-                    "tenkan": None if _last(tenkan) is None else round(_last(tenkan), 6),
-                    "kijun":  None if _last(kijun)  is None else round(_last(kijun), 6),
-                    "span_a": None if _last(span_a) is None else round(_last(span_a), 6),
-                    "span_b": None if _last(span_b) is None else round(_last(span_b), 6),
-                }
-            if parabolic_sar:
-                psar = parabolic_sar(highs, lows)
-                extras["psar"] = None if _last(psar) is None else round(_last(psar), 6)
-        except Exception as e:
-            extras["error"] = str(e)
+    # indicadores básicos para confirmações
+    i = len(closes) - 1
+    c = float(closes[i])
 
-    # (opcional) somar extras ao score — mantenha 0.0 para não afetar
-    if EXTRA_W > 0.0 and extras:
-        # Exemplo simples: se stoch_k > stoch_d e close acima de kijun -> +0.1
-        extra_conf = 0.0
-        try:
-            st_k = extras.get("stoch_k")
-            st_d = extras.get("stoch_d")
-            kij  = extras.get("ichimoku", {}).get("kijun")
-            c    = dbg.get("close")
-            if st_k is not None and st_d is not None and kij is not None and c is not None:
-                if st_k > st_d and c > kij:
-                    extra_conf = 0.7
-                else:
-                    extra_conf = 0.3
-        except Exception:
-            extra_conf = 0.0
-        tech_score = _clamp01((1.0 - EXTRA_W)*tech_score + EXTRA_W*extra_conf)
+    r = rsi(closes, 14)
+    macd_line, signal_line, hist = macd(closes, 12, 26, 9)
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    bb_up, bb_mid, bb_low = bollinger(closes, 20, 2.0)
 
+    r_i       = _last_safe(r, i)
+    macd_i    = _last_safe(macd_line, i)
+    macdsig_i = _last_safe(signal_line, i)
+    ema20_i   = _last_safe(ema20, i)
+    ema50_i   = _last_safe(ema50, i)
+    bb_low_i  = _last_safe(bb_low, i)
+
+    rsi_ok   = (r_i is not None) and (45 <= r_i <= 65)
+    macd_ok  = (macd_i is not None and macdsig_i is not None and macd_i > macdsig_i)
+    ema_ok   = (ema20_i is not None and ema50_i is not None and ema20_i > ema50_i)
+    bb_ok    = (bb_low_i is not None and c <= bb_low_i * 1.01)
+
+    confirmations = sum([rsi_ok, macd_ok, ema_ok, bb_ok])
+
+    # Regra flexível: se o score for bem acima do threshold, 1 confirmação já basta.
+    # Se for na margem, precisa de 2. Se for na risca, 3.
+    needed = 1 if sc >= (SCORE_THRESHOLD + 0.10) else (2 if sc >= (SCORE_THRESHOLD + 0.02) else 3)
+
+    if sc < SCORE_THRESHOLD or confirmations < needed:
+        if EXTRA_LOG:
+            print(f"{symbol}: score={sc:.2f}, confs={confirmations}/{needed} -> sem sinal.")
+        return None
+
+    # Plano de trade
     plan = _build_trade_plan(closes)
     if plan is None:
+        if EXTRA_LOG:
+            print(f"{symbol}: não conseguiu montar plano (ATR-like).")
         return None
 
+    # Confiança inicial baseada no score
+    confidence = sc
+
+    # Bonus/pênalti de confirmações
+    if confirmations >= 4:
+        confidence += 0.10
+    elif confirmations == 3:
+        confidence += 0.05
+    elif confirmations == 2:
+        confidence -= 0.05
+    else:  # 1
+        confidence -= 0.10
+
+    # Ajuste de sentimento (se disponível)
+    if HAS_SENTIMENT and WEIGHT_SENT != 0.0:
+        try:
+            sent = get_sentiment_score(symbol)  # [-1..1]
+            # mapeia sentimento para ajuste: positivo ajuda, negativo reduz
+            confidence = (1 - abs(WEIGHT_SENT)) * confidence + (WEIGHT_SENT) * ((sent + 1.0) / 2.0)
+            if EXTRA_LOG:
+                print(f"🧠 Sentiment {symbol}: {sent:+.2f} -> confiança ajustada={confidence:.2f}")
+        except Exception as e:
+            if EXTRA_LOG:
+                print(f"⚠️  Falha sentimento {symbol}: {e}")
+
+    # clamp confiança
+    confidence = max(0.0, min(1.0, confidence))
+
+    if confidence < MIN_CONFIDENCE:
+        if EXTRA_LOG:
+            print(f"{symbol}: confiança {confidence:.2f} < MIN_CONFIDENCE {MIN_CONFIDENCE:.2f}")
+        return None
+
+    # monta sinal
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     sig = {
         "symbol": symbol,
-        "timestamp": int(candles[-1].get("ts", 0) or 0),
-        "confidence": round(tech_score, 4),  # apenas técnico; o final com sentimento é feito no main
+        "timestamp": int(time.time()),
+        "confidence": round(confidence, 4),
         "entry": plan["entry"],
         "tp": plan["tp"],
         "sl": plan["sl"],
-        "risk_reward": RISK_R,
-        "strategy": "RSI+MACD+EMA+BB",  # o main acrescenta +NEWS quando combina
+        "strategy": "RSI+MACD+EMA+BB" + ("+EXTRAS" if HAS_EXTRAS and EXTRA_SCORE_WEIGHT > 0 else ""),
         "source": "coingecko",
-        "debug": {
-            "subs": subs,
-            "base": dbg,
-            "extras": extras if extras else None,
-        },
+        "created_at": created_at,
+        "id": f"{symbol}-{int(time.time())}"
     }
+
+    if EXTRA_LOG:
+        print(f"✅ {symbol}: sinal gerado | score={sc:.2f} confs={confirmations} conf={sig['confidence']:.2f}")
+
     return sig
