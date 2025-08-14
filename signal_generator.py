@@ -1,32 +1,42 @@
-# -*- coding: utf-8 -*-
-import os, json
-from typing import Dict, Any, List
-from signals_model import normalize_signal
+# signal_generator.py
+from typing import Dict, Any
+from signal_model import normalize_signal  # ✅ Ajustado para singular
+import json
+import os
 
-SIGNALS_FILE = os.getenv("SIGNALS_FILE", "signals.json")
+SIGNALS_FILE = "signals.json"
 
-def _ensure_file(path: str, default):
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(default, f, ensure_ascii=False, indent=2)
+def append_signal(signal: Dict[str, Any]):
+    """
+    Adiciona um novo sinal ao arquivo signals.json.
+    """
+    # Normaliza o sinal antes de salvar
+    signal = normalize_signal(signal)
 
-_ensure_file(SIGNALS_FILE, [])  # lista de sinais abertos
+    # Carrega sinais existentes
+    if os.path.exists(SIGNALS_FILE):
+        with open(SIGNALS_FILE, "r") as f:
+            try:
+                signals = json.load(f)
+            except json.JSONDecodeError:
+                signals = []
+    else:
+        signals = []
 
-def load_signals() -> List[Dict[str, Any]]:
-    try:
-        with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    # Adiciona novo sinal
+    signals.append(signal)
 
-def save_signals(rows: List[Dict[str, Any]]) -> None:
-    with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
+    # Salva de volta
+    with open(SIGNALS_FILE, "w") as f:
+        json.dump(signals, f, indent=4)
 
-def append_signal(sig: Dict[str, Any]) -> None:
-    data = load_signals()
-    data.append(normalize_signal(sig))
-    save_signals(data)
+    print(f"✅ Sinal adicionado: {signal['symbol']} | Confiança: {signal['confidence']:.2f}")
 
-def list_open_signals() -> List[Dict[str, Any]]:
-    return load_signals()
+def normalize_and_save(signals_list):
+    """
+    Normaliza todos os sinais e salva no arquivo.
+    """
+    normalized = [normalize_signal(s) for s in signals_list]
+    with open(SIGNALS_FILE, "w") as f:
+        json.dump(normalized, f, indent=4)
+    print(f"💾 {len(normalized)} sinais salvos.")
