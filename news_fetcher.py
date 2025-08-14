@@ -1,53 +1,70 @@
+# -*- coding: utf-8 -*-
+"""
+news_fetcher.py
+Busca títulos de notícias recentes para um símbolo (ex.: BTCUSDT).
+- Fonte 1 (opcional): TheNewsAPI (https://www.thenewsapi.com/) - via env THENEWS_API_KEY
+- Fonte 2 (opcional): RSS (lista separada por ';' em RSS_SOURCES)
+
+Retorna: list[str] de títulos (sem duplicados).
+"""
+
 import os
+import time
+import json
+import math
 import requests
 from datetime import datetime, timedelta
+from typing import List, Dict, Set
+from xml.etree import ElementTree as ET
 
-# URL base da TheNewsAPI
-THENEWS_API_URL = "https://api.thenewsapi.com/v1/news/all"
+# --------------------------
+# Config via ENV
+# --------------------------
+USE_THENEWSAPI = os.getenv("USE_THENEWSAPI", "true").lower() == "true"
+USE_RSS_NEW    = os.getenv("USE_RSS_NEW", "true").lower() == "true"
 
-def get_recent_news(symbol):
-    """Busca notícias recentes relacionadas a um símbolo usando TheNewsAPI."""
-    
-    api_key = os.getenv("THENEWS_API_KEY")
-    
-    if not api_key:
-        print("⚠️ Chave da TheNewsAPI não encontrada no .env. Pulando análise de notícias.")
-        return []
+THENEWS_API_KEY = os.getenv("THENEWS_API_KEY", "").strip()
 
-    # Formata o termo de busca (ex: BTCUSDT -> Bitcoin OR BTC)
-    currency_name = symbol.replace("USDT", "").lower()
-    currency_code = symbol.replace("USDT", "")
-    query = f"{currency_name} OR {currency_code}"
+# janela de busca
+NEWS_LOOKBACK_HOURS = int(os.getenv("NEWS_LOOKBACK_HOURS", "12"))
+# limite por fonte (evita spam e viés)
+NEWS_MAX_PER_SOURCE = int(os.getenv("NEWS_MAX_PER_SOURCE", "5"))
+# timeout de cada request
+NEWS_TIMEOUT = int(os.getenv("NEWS_TIMEOUT", "10"))
 
-    # Filtra para as últimas 24h
-    date_from = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+# RSS: string com urls separadas por ';'
+RSS_SOURCES = os.getenv("RSS_SOURCES",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/;"
+    "https://cointelegraph.com/rss;"
+    "https://www.binance.com/en/support/announcement/rss;"
+    "https://blog.kraken.com/feed/"
+)
 
-    try:
-        response = requests.get(
-            THENEWS_API_URL,
-            params={
-                "api_token": api_key,
-                "search": query,
-                "language": "en",
-                "published_on": date_from,
-                "limit": 10
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
+# Mapeia símbolo → termos de busca
+_SYMBOL_TERMS: Dict[str, List[str]] = {
+    "BTCUSDT": ["bitcoin", "btc"],
+    "ETHUSDT": ["ethereum", "eth"],
+    "BNBUSDT": ["binance coin", "bnb"],
+    "XRPUSDT": ["xrp", "ripple"],
+    "ADAUSDT": ["cardano", "ada"],
+    "DOGEUSDT": ["dogecoin", "doge"],
+    "SOLUSDT": ["solana", "sol"],
+    "MATICUSDT": ["polygon", "matic"],
+    "DOTUSDT": ["polkadot", "dot"],
+    "LTCUSDT": ["litecoin", "ltc"],
+    "LINKUSDT": ["chainlink", "link"],
+}
 
-        # Ajusta para formato padrão esperado pelo sentiment_analyzer
-        articles = []
-        for article in data.get("data", []):
-            articles.append({
-                "title": article.get("title"),
-                "description": article.get("description"),
-                "url": article.get("url"),
-                "published_at": article.get("published_at")
-            })
+# cache leve p/ reduzir chamadas
+_cache_titles: Dict[str, Dict] = {}  # { symbol: {"ts": epoch, "titles": List[str]} }
+_CACHE_TTL = 60 * 30  # 30 min
 
-        return articles
+def _now() -> float:
+    return time.time()
 
-    except requests.RequestException as e:
-        print(f"❌ Erro ao buscar notícias na TheNewsAPI: {e}")
-        return []
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for t in items:
+        k = (t or "").strip().lower()
+        if not k or k in seen:
