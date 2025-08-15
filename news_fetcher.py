@@ -1,172 +1,72 @@
 # -*- coding: utf-8 -*-
 """
-news_fetcher.py — integração com NewsData.io
-Retorna somente os TÍTULOS para uso no sentiment_analyzer.get_recent_news(symbol).
-
-Env vars aceitas:
-- NEWS_API_KEY           (obrigatória)
-- NEWS_LOOKBACK_HOURS    (default 24)
-- NEWS_MAX_PER_SOURCE    (default 5)   -> limite por fonte
-- NEWS_TIMEOUT           (default 10)  -> seconds
-- NEWS_LANGS             (default "en,pt") -> línguas separadas por vírgula
+news_fetcher.py - Busca manchetes de cripto (NewsData.io) com cache simples.
+Compatível com variáveis: NEWS_API_KEY ou THENEWS_API_KEY.
 """
 
-import os
-import time
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+import os, time, json
+from typing import List, Dict, Any
 import requests
 
-API_KEY = os.getenv("NEWS_API_KEY", "").strip()
-API_URL = "https://newsdata.io/api/1/news"
+# cache em memória (sobrevive ao processo, não ao restart)
+_CACHE: Dict[str, Any] = {}
+_TTL = int(os.getenv("NEWS_CACHE_TTL", "900"))  # 900s = 15 min
 
-LOOKBACK_HOURS = int(os.getenv("NEWS_LOOKBACK_HOURS", "24"))
-MAX_PER_SOURCE = int(os.getenv("NEWS_MAX_PER_SOURCE", "5"))
-REQ_TIMEOUT    = int(os.getenv("NEWS_TIMEOUT", "10"))
-LANGS          = [s.strip() for s in os.getenv("NEWS_LANGS", "en,pt").split(",") if s.strip()]
+def _get_key() -> str:
+    return (os.getenv("NEWS_API_KEY") 
+            or os.getenv("THENEWS_API_KEY") 
+            or "").strip()
 
-# Mapeia símbolo -> termos de busca mais eficazes
-_SYMBOL_KEYWORDS: Dict[str, List[str]] = {
-    "BTCUSDT": ["bitcoin", "btc"],
-    "ETHUSDT": ["ethereum", "eth"],
-    "BNBUSDT": ["binance coin", "bnb"],
-    "XRPUSDT": ["xrp", "ripple"],
-    "ADAUSDT": ["cardano", "ada"],
-    "DOGEUSDT": ["dogecoin", "doge"],
-    "SOLUSDT": ["solana", "sol"],
-    "MATICUSDT": ["polygon", "matic"],
-    "DOTUSDT": ["polkadot", "dot"],
-    "LTCUSDT": ["litecoin", "ltc"],
-    "LINKUSDT": ["chainlink", "link"],
-    "USDTUSDT": ["tether", "usdt"],
-    "USDCUSDT": ["usd coin", "usdc"],
-}
+def _now() -> float:
+    return time.time()
 
-def _keywords_for(symbol: str) -> List[str]:
-    sym = (symbol or "").upper().strip()
-    if sym in _SYMBOL_KEYWORDS:
-        return _SYMBOL_KEYWORDS[sym]
-    base = sym.replace("USDT", "").replace("USD", "")
-    if base:
-        return [base.lower()]
-    return [sym.lower()]
+def _cache_key(q: str, hours: int, max_items: int) -> str:
+    return f"{q}|{hours}|{max_items}"
 
-def _iso_date(dt: datetime) -> str:
-    # NewsData aceita from_date/to_date em YYYY-MM-DD
-    return dt.strftime("%Y-%m-%d")
-
-def _within_lookback(pub_iso: str, now: datetime) -> bool:
-    # NewsData costuma retornar pubDate ISO, ex: "2025-08-14 21:10:00"
-    try:
-        pub_iso = pub_iso.replace("Z", "")
-        # tenta formatos mais comuns
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-            try:
-                dt = datetime.strptime(pub_iso[:19], fmt).replace(tzinfo=timezone.utc)
-                break
-            except Exception:
-                continue
-        else:
-            return True  # se não parsear, não bloqueia pelo tempo
-        return (now - dt) <= timedelta(hours=LOOKBACK_HOURS)
-    except Exception:
-        return True
-
-def _dedupe_keep_limit_by_source(rows: List[dict]) -> List[str]:
-    """
-    Remove duplicados por título e limita quantidade por fonte.
-    Retorna somente títulos.
-    """
-    by_source: Dict[str, int] = {}
-    seen_titles = set()
-    titles: List[str] = []
-    for r in rows:
-        title = (r.get("title") or "").strip()
-        if not title:
-            continue
-        key = title.lower()
-        if key in seen_titles:
-            continue
-        source_id = (r.get("source_id") or r.get("source") or "unknown").lower()
-        count = by_source.get(source_id, 0)
-        if count >= MAX_PER_SOURCE > 0:
-            continue
-        by_source[source_id] = count + 1
-        seen_titles.add(key)
-        titles.append(title)
-    return titles
-
-def _fetch_page(q: str, page: Optional[str], from_date: str, to_date: str) -> dict:
-    params = {
-        "apikey": API_KEY,
-        "q": q,
-        "language": ",".join(LANGS),
-        "from_date": from_date,
-        "to_date": to_date,
-    }
-    if page:
-        params["page"] = page
-    r = requests.get(API_URL, params=params, timeout=REQ_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-def get_recent_news(symbol: str) -> List[str]:
-    """
-    Retorna lista de TÍTULOS recentes para o símbolo.
-    Usa OR entre palavras-chave (ex: "bitcoin OR btc").
-    Pagina até 3 páginas ou até 60 resultados brutos, filtra janela de LOOKBACK_HOURS
-    e limita por fonte.
-    """
-    if not API_KEY:
+def _fetch_from_api(query: str, hours: int, max_items: int) -> List[Dict[str, Any]]:
+    api_key = _get_key()
+    if not api_key:
         print("⚠️ NEWS_API_KEY não definido. Devolvendo lista vazia.")
         return []
 
-    now = datetime.now(timezone.utc)
-    from_date = _iso_date(now - timedelta(hours=LOOKBACK_HOURS))
-    to_date   = _iso_date(now)
+    # janela de tempo aprox (NewsData usa params de data também; aqui uso q e tamanho)
+    url = "https://newsdata.io/api/1/news"
+    params = {
+        "apikey": api_key,
+        "q": query,
+        "language": "en,pt",
+        "category": "business,technology",
+        "page": 1,
+        "size": max(10, max_items),
+    }
+    try:
+        r = requests.get(url, params=params, timeout=float(os.getenv("NEWS_TIMEOUT", "8")))
+        if r.status_code != 200:
+            print(f"⚠️ NewsData HTTP {r.status_code}: {r.text[:180]}")
+            return []
+        data = r.json()
+        articles = data.get("results") or data.get("articles") or []
+        rows = []
+        for a in articles[:max_items]:
+            rows.append({
+                "title": a.get("title"),
+                "desc": a.get("description"),
+                "link": a.get("link") or a.get("url"),
+                "pubDate": a.get("pubDate") or a.get("pubDate_tz") or a.get("pubDateUTC"),
+                "source": (a.get("source_id") or a.get("source") or ""),
+            })
+        return rows
+    except Exception as e:
+        print(f"⚠️ Erro NewsData: {e}")
+        return []
 
-    # monta consulta: "bitcoin OR btc"
-    terms = _keywords_for(symbol)
-    query = " OR ".join(terms)
+def get_news(query: str, lookback_hours: int = 6, max_items: int = 20) -> List[Dict[str, Any]]:
+    """Retorna manchetes (com cache por 15min)."""
+    ck = _cache_key(query, lookback_hours, max_items)
+    hit = _CACHE.get(ck)
+    if hit and (_now() - hit["t"]) < _TTL:
+        return hit["data"]
 
-    all_rows: List[dict] = []
-    next_page: Optional[str] = None
-    pages = 0
-
-    while pages < 3:  # segura a mão no free tier
-        try:
-            data = _fetch_page(query, next_page, from_date, to_date)
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", "?")
-            txt = ""
-            try:
-                txt = e.response.text
-            except Exception:
-                pass
-            print(f"⚠️ NewsData HTTP {status}: {txt[:200]}")
-            break
-        except Exception as e:
-            print(f"⚠️ NewsData erro de rede: {e}")
-            break
-
-        results = data.get("results") or []
-        for it in results:
-            # filtra por janela de tempo quando possível
-            if _within_lookback(str(it.get("pubDate", "")), now):
-                all_rows.append(it)
-
-        next_page = data.get("nextPage")
-        pages += 1
-        # corta se já há bastante material bruto
-        if len(all_rows) >= 60 or not next_page:
-            break
-
-        # leve pausa para não dar flood
-        time.sleep(0.5)
-
-    titles = _dedupe_keep_limit_by_source(all_rows)
-    if not titles:
-        print(f"ℹ️ NewsData: sem títulos para {symbol} (query='{query}')")
-    else:
-        print(f"📰 NewsData: {len(titles)} títulos para {symbol} (query='{query}')")
-    return titles
+    rows = _fetch_from_api(query, lookback_hours, max_items)
+    _CACHE[ck] = {"t": _now(), "data": rows}
+    return rows
