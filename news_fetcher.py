@@ -1,47 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-news_fetcher.py
-Busca títulos de notícias recentes para um símbolo (ex.: BTCUSDT).
-- Fonte 1 (opcional): TheNewsAPI (https://www.thenewsapi.com/) - via env THENEWS_API_KEY
-- Fonte 2 (opcional): RSS (lista separada por ';' em RSS_SOURCES)
+news_fetcher.py — integração com NewsData.io
+Retorna somente os TÍTULOS para uso no sentiment_analyzer.get_recent_news(symbol).
 
-Retorna: list[str] de títulos (sem duplicados).
+Env vars aceitas:
+- NEWS_API_KEY           (obrigatória)
+- NEWS_LOOKBACK_HOURS    (default 24)
+- NEWS_MAX_PER_SOURCE    (default 5)   -> limite por fonte
+- NEWS_TIMEOUT           (default 10)  -> seconds
+- NEWS_LANGS             (default "en,pt") -> línguas separadas por vírgula
 """
 
 import os
 import time
-import json
-import math
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 import requests
-from datetime import datetime, timedelta
-from typing import List, Dict, Set
-from xml.etree import ElementTree as ET
 
-# --------------------------
-# Config via ENV
-# --------------------------
-USE_THENEWSAPI = os.getenv("USE_THENEWSAPI", "true").lower() == "true"
-USE_RSS_NEW    = os.getenv("USE_RSS_NEW", "true").lower() == "true"
+API_KEY = os.getenv("NEWS_API_KEY", "").strip()
+API_URL = "https://newsdata.io/api/1/news"
 
-THENEWS_API_KEY = os.getenv("THENEWS_API_KEY", "").strip()
+LOOKBACK_HOURS = int(os.getenv("NEWS_LOOKBACK_HOURS", "24"))
+MAX_PER_SOURCE = int(os.getenv("NEWS_MAX_PER_SOURCE", "5"))
+REQ_TIMEOUT    = int(os.getenv("NEWS_TIMEOUT", "10"))
+LANGS          = [s.strip() for s in os.getenv("NEWS_LANGS", "en,pt").split(",") if s.strip()]
 
-# janela de busca
-NEWS_LOOKBACK_HOURS = int(os.getenv("NEWS_LOOKBACK_HOURS", "12"))
-# limite por fonte (evita spam e viés)
-NEWS_MAX_PER_SOURCE = int(os.getenv("NEWS_MAX_PER_SOURCE", "5"))
-# timeout de cada request
-NEWS_TIMEOUT = int(os.getenv("NEWS_TIMEOUT", "10"))
-
-# RSS: string com urls separadas por ';'
-RSS_SOURCES = os.getenv("RSS_SOURCES",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/;"
-    "https://cointelegraph.com/rss;"
-    "https://www.binance.com/en/support/announcement/rss;"
-    "https://blog.kraken.com/feed/"
-)
-
-# Mapeia símbolo → termos de busca
-_SYMBOL_TERMS: Dict[str, List[str]] = {
+# Mapeia símbolo -> termos de busca mais eficazes
+_SYMBOL_KEYWORDS: Dict[str, List[str]] = {
     "BTCUSDT": ["bitcoin", "btc"],
     "ETHUSDT": ["ethereum", "eth"],
     "BNBUSDT": ["binance coin", "bnb"],
@@ -53,149 +38,135 @@ _SYMBOL_TERMS: Dict[str, List[str]] = {
     "DOTUSDT": ["polkadot", "dot"],
     "LTCUSDT": ["litecoin", "ltc"],
     "LINKUSDT": ["chainlink", "link"],
+    "USDTUSDT": ["tether", "usdt"],
+    "USDCUSDT": ["usd coin", "usdc"],
 }
 
-# cache leve p/ reduzir chamadas
-_cache_titles: Dict[str, Dict] = {}  # { symbol: {"ts": epoch, "titles": List[str]} }
-_CACHE_TTL = 60 * 30  # 30 min
+def _keywords_for(symbol: str) -> List[str]:
+    sym = (symbol or "").upper().strip()
+    if sym in _SYMBOL_KEYWORDS:
+        return _SYMBOL_KEYWORDS[sym]
+    base = sym.replace("USDT", "").replace("USD", "")
+    if base:
+        return [base.lower()]
+    return [sym.lower()]
 
-def _now() -> float:
-    return time.time()
+def _iso_date(dt: datetime) -> str:
+    # NewsData aceita from_date/to_date em YYYY-MM-DD
+    return dt.strftime("%Y-%m-%d")
 
-def _dedupe_keep_order(items: List[str]) -> List[str]:
-    seen: Set[str] = set()
-    out: List[str] = []
-    for t in items:
-        k = (t or "").strip().lower()
-        if not k or k in seen:
-            continue
-        seen.add(k)
-        out.append(t.strip())
-    return out
-
-# ---------------------------------------------------------------------
-# TheNewsAPI
-# Doc geral: https://www.thenewsapi.com/
-# Endpoint típico: GET https://api.thenewsapi.com/v1/news/all
-#   params:
-#     api_token=... (OBRIGATÓRIO)
-#     search=bitcoin
-#     published_after=YYYY-MM-DDTHH:MM:SSZ
-#     languages=en,pt
-#     limit=20
-# ---------------------------------------------------------------------
-def _fetch_from_thenewsapi(symbol: str) -> List[str]:
-    if not THENEWS_API_KEY:
-        return []
-
-    terms = _SYMBOL_TERMS.get(symbol, [symbol.replace("USDT", "")])
-    query = " OR ".join(terms)
-
-    published_after = (datetime.utcnow() - timedelta(hours=NEWS_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    url = "https://api.thenewsapi.com/v1/news/all"
-    params = {
-        "api_token": THENEWS_API_KEY,
-        "search": query,
-        "published_after": published_after,
-        "languages": "en,pt",
-        "limit": max(NEWS_MAX_PER_SOURCE * 2, 10),  # pega um pouco mais e filtramos
-    }
-
-    titles: List[str] = []
+def _within_lookback(pub_iso: str, now: datetime) -> bool:
+    # NewsData costuma retornar pubDate ISO, ex: "2025-08-14 21:10:00"
     try:
-        r = requests.get(url, params=params, timeout=NEWS_TIMEOUT)
-        if r.status_code != 200:
-            print(f"⚠️ TheNewsAPI {symbol}: HTTP {r.status_code} - {r.text[:200]}")
-            return []
-        data = r.json()
-        # some responses hold articles in 'data' or 'news' depending on plan; we try both
-        articles = data.get("data") or data.get("news") or []
-        for a in articles:
-            t = a.get("title") or ""
-            if t:
-                titles.append(t)
-            if len(titles) >= NEWS_MAX_PER_SOURCE:
+        pub_iso = pub_iso.replace("Z", "")
+        # tenta formatos mais comuns
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(pub_iso[:19], fmt).replace(tzinfo=timezone.utc)
                 break
-    except Exception as e:
-        print(f"⚠️ TheNewsAPI erro {symbol}: {e}")
-        return []
-
-    return titles
-
-# ---------------------------------------------------------------------
-# RSS (sem feedparser; usa xml nativo)
-# ---------------------------------------------------------------------
-def _fetch_from_rss(symbol: str) -> List[str]:
-    # preferimos o primeiro termo para reduzir falsos positivos
-    primary = _SYMBOL_TERMS.get(symbol, [symbol.replace("USDT", "")])[0].lower()
-    titles: List[str] = []
-    since_dt = datetime.utcnow() - timedelta(hours=NEWS_LOOKBACK_HOURS)
-
-    for url in [u.strip() for u in (RSS_SOURCES or "").split(";") if u.strip()]:
-        if len(titles) >= NEWS_MAX_PER_SOURCE:
-            break
-        try:
-            r = requests.get(url, timeout=NEWS_TIMEOUT)
-            if r.status_code != 200:
-                print(f"⚠️ RSS {url} -> HTTP {r.status_code}")
+            except Exception:
                 continue
-            root = ET.fromstring(r.content)
+        else:
+            return True  # se não parsear, não bloqueia pelo tempo
+        return (now - dt) <= timedelta(hours=LOOKBACK_HOURS)
+    except Exception:
+        return True
 
-            # RSS padrão: channel/item/title, pubDate
-            for item in root.findall(".//item"):
-                if len(titles) >= NEWS_MAX_PER_SOURCE:
-                    break
-                title = (item.findtext("title") or "").strip()
-                if not title:
-                    continue
-                # filtro simples: título contém o termo?
-                if primary not in title.lower():
-                    continue
-
-                # filtra por data quando disponível
-                pub = item.findtext("pubDate") or ""
-                if pub:
-                    try:
-                        # tenta parse RFC2822 (Thu, 01 Jan 1970 00:00:00 GMT)
-                        from email.utils import parsedate_to_datetime
-                        dt = parsedate_to_datetime(pub)
-                        if dt.tzinfo:
-                            dt = dt.astimezone(tz=None).replace(tzinfo=None)
-                        if dt < since_dt:
-                            continue
-                    except Exception:
-                        pass
-
-                titles.append(title)
-        except Exception as e:
-            print(f"⚠️ RSS erro em {url}: {e}")
-
+def _dedupe_keep_limit_by_source(rows: List[dict]) -> List[str]:
+    """
+    Remove duplicados por título e limita quantidade por fonte.
+    Retorna somente títulos.
+    """
+    by_source: Dict[str, int] = {}
+    seen_titles = set()
+    titles: List[str] = []
+    for r in rows:
+        title = (r.get("title") or "").strip()
+        if not title:
+            continue
+        key = title.lower()
+        if key in seen_titles:
+            continue
+        source_id = (r.get("source_id") or r.get("source") or "unknown").lower()
+        count = by_source.get(source_id, 0)
+        if count >= MAX_PER_SOURCE > 0:
+            continue
+        by_source[source_id] = count + 1
+        seen_titles.add(key)
+        titles.append(title)
     return titles
 
-# ---------------------------------------------------------------------
-# API pública
-# ---------------------------------------------------------------------
+def _fetch_page(q: str, page: Optional[str], from_date: str, to_date: str) -> dict:
+    params = {
+        "apikey": API_KEY,
+        "q": q,
+        "language": ",".join(LANGS),
+        "from_date": from_date,
+        "to_date": to_date,
+    }
+    if page:
+        params["page"] = page
+    r = requests.get(API_URL, params=params, timeout=REQ_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
 def get_recent_news(symbol: str) -> List[str]:
     """
-    Retorna títulos de notícias recentes para o símbolo.
-    - Usa cache de 30 min.
-    - Consulta TheNewsAPI (se ativado) e RSS (se ativado).
+    Retorna lista de TÍTULOS recentes para o símbolo.
+    Usa OR entre palavras-chave (ex: "bitcoin OR btc").
+    Pagina até 3 páginas ou até 60 resultados brutos, filtra janela de LOOKBACK_HOURS
+    e limita por fonte.
     """
-    now = _now()
-    cached = _cache_titles.get(symbol)
-    if cached and (now - cached.get("ts", 0) < _CACHE_TTL):
-        return list(cached.get("titles", []))
+    if not API_KEY:
+        print("⚠️ NEWS_API_KEY não definido. Devolvendo lista vazia.")
+        return []
 
-    titles: List[str] = []
+    now = datetime.now(timezone.utc)
+    from_date = _iso_date(now - timedelta(hours=LOOKBACK_HOURS))
+    to_date   = _iso_date(now)
 
-    if USE_THENEWSAPI:
-        titles += _fetch_from_thenewsapi(symbol)
+    # monta consulta: "bitcoin OR btc"
+    terms = _keywords_for(symbol)
+    query = " OR ".join(terms)
 
-    if USE_RSS_NEW:
-        titles += _fetch_from_rss(symbol)
+    all_rows: List[dict] = []
+    next_page: Optional[str] = None
+    pages = 0
 
-    titles = _dedupe_keep_order(titles)
+    while pages < 3:  # segura a mão no free tier
+        try:
+            data = _fetch_page(query, next_page, from_date, to_date)
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", "?")
+            txt = ""
+            try:
+                txt = e.response.text
+            except Exception:
+                pass
+            print(f"⚠️ NewsData HTTP {status}: {txt[:200]}")
+            break
+        except Exception as e:
+            print(f"⚠️ NewsData erro de rede: {e}")
+            break
 
-    _cache_titles[symbol] = {"ts": now, "titles": titles}
+        results = data.get("results") or []
+        for it in results:
+            # filtra por janela de tempo quando possível
+            if _within_lookback(str(it.get("pubDate", "")), now):
+                all_rows.append(it)
+
+        next_page = data.get("nextPage")
+        pages += 1
+        # corta se já há bastante material bruto
+        if len(all_rows) >= 60 or not next_page:
+            break
+
+        # leve pausa para não dar flood
+        time.sleep(0.5)
+
+    titles = _dedupe_keep_limit_by_source(all_rows)
+    if not titles:
+        print(f"ℹ️ NewsData: sem títulos para {symbol} (query='{query}')")
+    else:
+        print(f"📰 NewsData: {len(titles)} títulos para {symbol} (query='{query}')")
     return titles
