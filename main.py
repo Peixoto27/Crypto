@@ -25,7 +25,9 @@ from signal_generator import append_signal  # salva no signals.json
 
 # ---- Sentimento (opcional; se não existir continua normal) ----
 try:
-    from sentiment_analyzer import get_sentiment_score  # [-1..1]
+    from sentiment_analyzer import get_sentiment_score  # retorna em [-1..1]
+    # diagnóstico: confirma se a key de notícias chegou ao container
+    print("🔎 NEWS key presente?:", bool(os.getenv("NEWS_API_KEY") or os.getenv("THENEWS_API_KEY")))
 except Exception:
     def get_sentiment_score(symbol: str) -> float:
         return 0.0
@@ -40,8 +42,8 @@ SELECT_PER_CYCLE  = int(os.getenv("SELECT_PER_CYCLE", "12"))      # quantas moed
 DAYS_OHLC         = int(os.getenv("DAYS_OHLC", "14"))
 MIN_BARS          = int(os.getenv("MIN_BARS", "40"))
 
-SCORE_THRESHOLD   = float(os.getenv("SCORE_THRESHOLD", "0.70"))   # limiar do score técnico
-MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.60"))    # limiar da confiança final (após mistura)
+SCORE_THRESHOLD   = float(os.getenv("SCORE_THRESHOLD", "0.70"))   # limiar do score técnico (0..1)
+MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.60"))    # confiança final (0..1)
 
 # anti-duplicados
 COOLDOWN_HOURS        = float(os.getenv("COOLDOWN_HOURS", "6"))
@@ -51,7 +53,7 @@ CHANGE_THRESHOLD_PCT  = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
 WEIGHT_TECH = float(os.getenv("WEIGHT_TECH", "1.0"))
 WEIGHT_SENT = float(os.getenv("WEIGHT_SENT", "0.0"))  # 0.0 = ignorar sentimento
 
-# arquivos utilitários (iguais aos que você já usa nos logs)
+# arquivos utilitários
 DATA_RAW_FILE  = os.getenv("DATA_RAW_FILE", "data_raw.json")
 CURSOR_FILE    = os.getenv("CURSOR_FILE", "scan_state.json")   # para rotacionar as moedas
 SIGNALS_FILE   = os.getenv("SIGNALS_FILE", "signals.json")     # usado pelo append_signal
@@ -100,9 +102,7 @@ def _safe_score(ohlc) -> float:
         if isinstance(res, tuple):
             s = float(res[0])
         elif isinstance(res, dict):
-            s = float(
-                res.get("score", res.get("value", res.get("confidence", res.get("prob", 0.0))))
-            )
+            s = float(res.get("score", res.get("value", res.get("confidence", res.get("prob", 0.0)))))
         else:
             s = float(res)
     except Exception:
@@ -135,7 +135,7 @@ def run_pipeline():
     if SYMBOLS:
         universe = SYMBOLS[:]  # lista fixa via env
     else:
-        universe = fetch_top_symbols(TOP_SYMBOLS)  # dinâmica no CG
+        universe = fetch_top_symbols(TOP_SYMBOLS)  # dinâmica no CoinGecko
 
     # 2) rotaciona para este ciclo
     selected = _rotate(universe, SELECT_PER_CYCLE)
@@ -145,11 +145,10 @@ def run_pipeline():
     for sym in selected:
         print(f"📊 Coletando OHLC {sym} (days={DAYS_OHLC})…")
         try:
-            raw = fetch_ohlc(sym, DAYS_OHLC)   # pode retornar list[ [ts, o, h, l, c], ... ] ou dicts
+            raw = fetch_ohlc(sym, DAYS_OHLC)   # list de candles normalizados
             if not raw or len(raw) < MIN_BARS:
                 print(f"❌ Dados insuficientes para {sym}")
                 continue
-            # guardamos como veio; já normalizado no fetcher
             collected[sym] = raw
             ok_symbols.append(sym)
             print(f"   → OK | candles={len(raw)}")
@@ -160,7 +159,7 @@ def run_pipeline():
         print("❌ Nenhum ativo com OHLC suficiente.")
         return
 
-    # 4) salva debug
+    # 4) salva debug de OHLC
     try:
         with open(DATA_RAW_FILE, "w", encoding="utf-8") as f:
             json.dump({"symbols": ok_symbols, "data": collected}, f, ensure_ascii=False)
@@ -172,11 +171,10 @@ def run_pipeline():
     saved_count = 0
     for sym in ok_symbols:
         ohlc = collected.get(sym)
+
         # score técnico
         score = _safe_score(ohlc)
         print(f"ℹ️ Score {sym}: {round(score*100,1)}% (min {int(SCORE_THRESHOLD*100)}%)")
-
-        # checa limiar técnico
         if score < SCORE_THRESHOLD:
             continue
 
@@ -188,7 +186,6 @@ def run_pipeline():
 
         conf = _mix_confidence(score, sent)
         if conf < MIN_CONFIDENCE:
-            # abaixo da confiança mínima global
             continue
 
         # gera plano (entry/tp/sl)
@@ -202,7 +199,7 @@ def run_pipeline():
             print(f"⚠️ {sym}: sem sinal técnico.")
             continue
 
-        # completa o payload do sinal
+        # completa o payload
         sig["symbol"]     = sym
         sig["rr"]         = float(sig.get("rr", 2.0))
         sig["confidence"] = float(conf)
@@ -217,9 +214,7 @@ def run_pipeline():
             cooldown_hours=COOLDOWN_HOURS,
             change_threshold_pct=CHANGE_THRESHOLD_PCT
         )
-
         if not ok_to_send:
-            # opcional: log de quase-sinal
             print(f"🟡 {sym} não enviado ({reason}).")
             continue
 
@@ -254,3 +249,6 @@ def run_pipeline():
 
     print(f"🗂 {saved_count} sinais salvos em {SIGNALS_FILE}")
     print(f"🕒 Fim: {_ts()}")
+
+if __name__ == "__main__":
+    run_pipeline()
