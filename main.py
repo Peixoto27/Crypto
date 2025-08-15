@@ -4,7 +4,7 @@ main.py — pipeline principal
 - Seleciona o conjunto de moedas (dinâmico via CoinGecko ou fixo via env)
 - Coleta OHLC
 - Calcula score técnico
-- (Opcional) mistura com sentimento
+- (Opcional) mistura com sentimento (NewsData.io / RSS)
 - Gera sinal (entry/tp/sl) quando houver
 - Evita duplicados via positions_manager
 - Envia para o Telegram e grava em signals.json
@@ -14,25 +14,51 @@ import os
 import json
 import time
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
-# ---- Módulos do projeto (já existentes) ----
+# ========= Módulos do projeto =========
 from data_fetcher_coingecko import fetch_ohlc, fetch_top_symbols
 from apply_strategies import generate_signal, score_signal
 from notifier_telegram import send_signal_notification
 from positions_manager import should_send_and_register
 from signal_generator import append_signal  # salva no signals.json
 
-# ---- Sentimento (opcional; se não existir continua normal) ----
+# ========= Sentimento (opcional) =========
+# Aceita duas assinaturas:
+#   get_sentiment_score("BTCUSDT") -> float   (-1..1)
+#   get_sentiment_score("BTCUSDT") -> (float, int)  # score e contagem de notícias usadas
 try:
-    from sentiment_analyzer import get_sentiment_score  # [-1..1]
+    from sentiment_analyzer import get_sentiment_score as _sentiment_fn
+    HAVE_SENTIMENT = True
 except Exception:
-    def get_sentiment_score(symbol: str) -> float:
+    HAVE_SENTIMENT = False
+    def _sentiment_fn(symbol: str):
         return 0.0
 
-# ==============================
-# Config via Environment
-# ==============================
+def _get_sent_and_count(symbol: str) -> Tuple[float, int | None]:
+    """Retorna (score -1..1, n_noticias ou None). Nunca levanta exceção."""
+    try:
+        res = _sentiment_fn(symbol)
+        if isinstance(res, tuple):
+            score = float(res[0])
+            n = None
+            if len(res) > 1 and res[1] is not None:
+                try:
+                    n = int(res[1])
+                except Exception:
+                    n = None
+        else:
+            score = float(res)
+            n = None
+    except Exception as e:
+        print(f"🧠 Sentimento erro {symbol}: {e}")
+        return 0.0, None
+
+    # clamp
+    score = max(-1.0, min(1.0, score))
+    return score, n
+
+# ========= Config via Environment =========
 SYMBOLS = [s for s in os.getenv("SYMBOLS", "").replace(" ", "").split(",") if s]  # vazio = dinâmico
 
 TOP_SYMBOLS       = int(os.getenv("TOP_SYMBOLS", "100"))          # quando dinâmico
@@ -40,27 +66,26 @@ SELECT_PER_CYCLE  = int(os.getenv("SELECT_PER_CYCLE", "12"))      # quantas moed
 DAYS_OHLC         = int(os.getenv("DAYS_OHLC", "14"))
 MIN_BARS          = int(os.getenv("MIN_BARS", "40"))
 
-SCORE_THRESHOLD   = float(os.getenv("SCORE_THRESHOLD", "0.70"))   # limiar do score técnico (0..1)
-MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.60"))    # confiança final mínima (0..1)
+SCORE_THRESHOLD   = float(os.getenv("SCORE_THRESHOLD", "0.70"))   # limiar score técnico
+MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.60"))    # limiar confiança final
 
 # anti-duplicados
 COOLDOWN_HOURS        = float(os.getenv("COOLDOWN_HOURS", "6"))
 CHANGE_THRESHOLD_PCT  = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
 
-# mistura técnica + sentimento (se quiser usar)
+# mistura técnica + sentimento
 WEIGHT_TECH = float(os.getenv("WEIGHT_TECH", "1.0"))
 WEIGHT_SENT = float(os.getenv("WEIGHT_SENT", "0.0"))  # 0.0 = ignorar sentimento
 
-# arquivos utilitários
+# arquivos auxiliares
 DATA_RAW_FILE  = os.getenv("DATA_RAW_FILE", "data_raw.json")
 CURSOR_FILE    = os.getenv("CURSOR_FILE", "scan_state.json")   # para rotacionar as moedas
-SIGNALS_FILE   = os.getenv("SIGNALS_FILE", "signals.json")     # usado pelo append_signal
+SIGNALS_FILE   = os.getenv("SIGNALS_FILE", "signals.json")
 
-DEBUG_SCORE    = os.getenv("DEBUG_SCORE", "false").lower() in ("1", "true", "yes")
+# Só para log: key de news presente?
+print("🔎 NEWS key presente?:", bool(os.getenv("NEWS_API_KEY")))
 
-# ==============================
-# Helpers
-# ==============================
+# ========= Helpers =========
 def _ts() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -92,58 +117,30 @@ def _rotate(symbols: List[str], take: int) -> List[str]:
 
 def _safe_score(ohlc) -> float:
     """
-    Chama score_signal e tolera diferentes formatos:
-      - float 0..1  ou 0..100
-      - str "0.83" ou "83%"
+    Chama score_signal e tolera diferentes formatos de retorno:
+      - float 0..1
       - tuple (score, ...)
-      - dict com chaves variadas: score, score_pct, value, confidence, prob, s
+      - dict {"score": 0..1, ...}
+    Nunca levanta exceção; retorna 0.0 em caso de erro.
     """
-    res = None
     try:
         res = score_signal(ohlc)
-        s = None
-
-        # tuple -> pega o primeiro
-        if isinstance(res, tuple) and len(res) > 0:
-            res = res[0]
-
-        if isinstance(res, dict):
-            for k in ("score", "score_pct", "score_percent", "value",
-                      "confidence", "prob", "s"):
-                if k in res:
-                    s = res[k]
-                    break
-            if s is None:
-                # pega a primeira coisa "numérica"
-                for v in res.values():
-                    if isinstance(v, (int, float, str)):
-                        s = v
-                        break
+        if isinstance(res, tuple):
+            s = float(res[0])
+        elif isinstance(res, dict):
+            s = float(
+                res.get("score", res.get("value", res.get("confidence", res.get("prob", 0.0))))
+            )
         else:
-            s = res
-
-        # str -> trata "0.82" ou "82%"
-        if isinstance(s, str):
-            s = s.strip()
-            if s.endswith("%"):
-                s = float(s[:-1]) / 100.0
-            else:
-                s = float(s)
-
-        if s is None:
-            s = 0.0
-        else:
-            s = float(s)
-
-        if s > 1.0:
-            s = s / 100.0
-
+            s = float(res)
     except Exception as e:
-        print(f"⚠️ _safe_score: retorno inesperado de score_signal -> {type(res)} {res if res is not None else ''} ({e})")
+        print(f"⚠️ DEBUG score_signal quebrou: {e}")
         s = 0.0
 
-    if s != s:  # NaN
-        s = 0.0
+    # normaliza se vier em %
+    if s > 1.0:
+        s = s / 100.0
+    # clip 0..1
     return max(0.0, min(1.0, round(s, 6)))
 
 def _mix_confidence(score_tech: float, sent: float) -> float:
@@ -156,24 +153,19 @@ def _mix_confidence(score_tech: float, sent: float) -> float:
     mixed = (WEIGHT_TECH * score_tech + WEIGHT_SENT * sent01) / total_w
     return max(0.0, min(1.0, mixed))
 
-# ==============================
-# Pipeline principal
-# ==============================
+# ========= Pipeline =========
 def run_pipeline():
-    # só pra confirmar News API no log
-    print("🔎 NEWS key presente?:", bool(os.getenv("NEWSDATA_API_KEY") or os.getenv("THENEWS_API_KEY")))
-
     print("🧩 Coletando PREÇOS / OHLC…")
     collected: Dict[str, Any] = {}
     ok_symbols: List[str] = []
 
-    # 1) escolhe universo
+    # 1) universo
     if SYMBOLS:
         universe = SYMBOLS[:]  # lista fixa via env
     else:
-        universe = fetch_top_symbols(TOP_SYMBOLS)  # dinâmica no CG
+        universe = fetch_top_symbols(TOP_SYMBOLS)  # dinâmica no CoinGecko
 
-    # 2) rotaciona para este ciclo
+    # 2) lote deste ciclo (rotação)
     selected = _rotate(universe, SELECT_PER_CYCLE)
     print(f"🧪 Moedas deste ciclo ({len(selected)}/{len(universe)}): {', '.join(selected)}")
 
@@ -181,7 +173,7 @@ def run_pipeline():
     for sym in selected:
         print(f"📊 Coletando OHLC {sym} (days={DAYS_OHLC})…")
         try:
-            raw = fetch_ohlc(sym, DAYS_OHLC)   # list de candles normalizada
+            raw = fetch_ohlc(sym, DAYS_OHLC)  # list de candles já normalizada pelo fetcher
             if not raw or len(raw) < MIN_BARS:
                 print(f"❌ Dados insuficientes para {sym}")
                 continue
@@ -208,28 +200,19 @@ def run_pipeline():
     for sym in ok_symbols:
         ohlc = collected.get(sym)
 
-        # score técnico (robusto)
+        # score técnico
         score = _safe_score(ohlc)
         print(f"ℹ️ Score {sym}: {round(score*100,1)}% (min {int(SCORE_THRESHOLD*100)}%)")
-
-        # debug opcional se score vier 0.0
-        if score == 0.0 and DEBUG_SCORE:
-            try:
-                raw_res = score_signal(ohlc)
-                print(f"🔍 DEBUG score_signal({sym}) => {type(raw_res)} {raw_res}")
-            except Exception as e:
-                print(f"🔍 DEBUG score_signal({sym}) quebrou: {e}")
-
         if score < SCORE_THRESHOLD:
             continue
 
         # sentimento opcional
-        try:
-            sent = get_sentiment_score(sym)
-        except Exception:
-            sent = 0.0
+        sent_score, n_news = _get_sent_and_count(sym) if HAVE_SENTIMENT else (0.0, None)
+        if WEIGHT_SENT > 0.0:
+            tag = f"(n={n_news})" if n_news is not None else "(n=?)"
+            print(f"🧠 Sentimento {sym}: {round(sent_score,3)} {tag}")
 
-        conf = _mix_confidence(score, sent)
+        conf = _mix_confidence(score, sent_score)
         if conf < MIN_CONFIDENCE:
             continue
 
@@ -263,7 +246,7 @@ def run_pipeline():
             print(f"🟡 {sym} não enviado ({reason}).")
             continue
 
-        # envia para o Telegram
+        # envia
         pushed = False
         try:
             pushed = send_signal_notification({
@@ -280,12 +263,9 @@ def run_pipeline():
         except Exception as e:
             print(f"⚠️ Falha no envio (notifier): {e}")
 
-        if pushed:
-            print("✅ Notificação enviada.")
-        else:
-            print("❌ Falha no envio (ver notifier_telegram).")
+        print("✅ Notificação enviada." if pushed else "❌ Falha no envio (ver notifier_telegram).")
 
-        # registra no arquivo de sinais
+        # persiste no arquivo de sinais
         try:
             append_signal(sig)
             saved_count += 1
@@ -295,5 +275,6 @@ def run_pipeline():
     print(f"🗂 {saved_count} sinais salvos em {SIGNALS_FILE}")
     print(f"🕒 Fim: {_ts()}")
 
+# ========= Entrypoint =========
 if __name__ == "__main__":
     run_pipeline()
