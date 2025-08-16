@@ -1,369 +1,521 @@
 # -*- coding: utf-8 -*-
 """
 apply_strategies.py
-- Calcula indicadores técnicos e retorna um score 0..1
-- Gera um plano simples de trade (entry/tp/sl) quando o score for bom
-Obs.: não usa libs externas (só python puro), para rodar no Railway.
+- Calcula indicadores técnicos a partir de OHLC
+- Consolida um score técnico (0..1) com pesos configuráveis via ENV
+- Gera plano básico de trade (entry/tp/sl) a partir de volatilidade (ATR/BB)
+
+Compatível com OHLC em:
+  - list[dict]: {"time","open","high","low","close"}
+  - list[list|tuple]: [ts, open, high, low, close]
+
+Variáveis de ambiente (exemplos):
+  W_RSI=1.0          EN_STOCHRSI=true
+  W_MACD=1.0
+  W_EMA=1.0
+  W_BB=0.7
+  W_STOCHRSI=0.8
+  W_ADX=0.8          EN_ADX=true
+  W_ATR=0.0          EN_ATR=false
+  W_CCI=0.5          EN_CCI=true
+  W_ICHI=0.8         EN_ICHI=true
+  W_OBV=0.6          EN_OBV=true
+  W_MFI=0.6          EN_MFI=true
+  W_WILLR=0.5        EN_WILLR=true
+
+  DEBUG_INDICATORS=true
+
+Retornos:
+  - score_signal(ohlc) -> (score_float_0_1, details_dict)
+  - generate_signal(ohlc) -> dict {entry,tp,sl,rr,strategy,created_at}
 """
 
 import os
 import math
-from typing import List, Dict, Any
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
 
-# =========================
-# Config por ENV (pesos)
-# =========================
-def _b(v: str, default: bool = True) -> bool:
-    return os.getenv(v, "true" if default else "false").strip().lower() in ("1","true","yes","y","on")
+import numpy as np
 
-W_RSI       = float(os.getenv("W_RSI",       "1.0"))
-W_MACD      = float(os.getenv("W_MACD",      "1.0"))
-W_EMA       = float(os.getenv("W_EMA",       "1.0"))
-W_BB        = float(os.getenv("W_BB",        "0.7"))
-W_STOCHRSI  = float(os.getenv("W_STOCHRSI",  "0.8"))
-W_ADX       = float(os.getenv("W_ADX",       "0.8"))
-W_ATR       = float(os.getenv("W_ATR",       "0.0"))  # por padrão não influencia
-W_CCI       = float(os.getenv("W_CCI",       "0.5"))
 
-EN_STOCHRSI = _b("EN_STOCHRSI", True)
-EN_ADX      = _b("EN_ADX",      True)
-EN_ATR      = _b("EN_ATR",      False)
-EN_CCI      = _b("EN_CCI",      True)
+# ==========================
+# Leitura de ENV (pesos/flags)
+# ==========================
+def _fenv(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
-DEBUG_IND   = _b("DEBUG_INDICATORS", False)
 
-# =========================
-# Helpers de séries
-# =========================
-def _clamp(x: float, a: float, b: float) -> float:
-    return max(a, min(b, x))
+def _benv(name: str, default: bool) -> bool:
+    s = os.getenv(name, None)
+    if s is None:
+        return default
+    return str(s).strip().lower() in ("1", "true", "yes", "y", "on")
 
-def _ema(values: List[float], period: int) -> List[float]:
-    if period <= 1 or len(values) == 0:
-        return values[:]
+
+W_RSI       = _fenv("W_RSI", 1.0)
+W_MACD      = _fenv("W_MACD", 1.0)
+W_EMA       = _fenv("W_EMA", 1.0)
+W_BB        = _fenv("W_BB", 0.7)
+W_STOCHRSI  = _fenv("W_STOCHRSI", 0.8)
+W_ADX       = _fenv("W_ADX", 0.8)
+W_ATR       = _fenv("W_ATR", 0.0)
+W_CCI       = _fenv("W_CCI", 0.5)
+
+# Novos
+W_ICHI      = _fenv("W_ICHI", 0.8)
+W_OBV       = _fenv("W_OBV", 0.6)
+W_MFI       = _fenv("W_MFI", 0.6)
+W_WILLR     = _fenv("W_WILLR", 0.5)
+
+EN_STOCHRSI = _benv("EN_STOCHRSI", True)
+EN_ADX      = _benv("EN_ADX", True)
+EN_ATR      = _benv("EN_ATR", False)
+EN_CCI      = _benv("EN_CCI", True)
+
+# Novos
+EN_ICHI     = _benv("EN_ICHI", True)
+EN_OBV      = _benv("EN_OBV", True)
+EN_MFI      = _benv("EN_MFI", True)
+EN_WILLR    = _benv("EN_WILLR", True)
+
+DEBUG_INDICATORS = _benv("DEBUG_INDICATORS", True)
+
+
+def _ts() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ==========================
+# Utilidades de OHLC
+# ==========================
+def _to_arrays(ohlc: List[Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Converte OHLC em arrays numpy (ts, o, h, l, c).
+    Aceita lista de dicts ou lista de listas/tuplas.
+    """
+    if not ohlc:
+        raise ValueError("OHLC vazio")
+
+    if isinstance(ohlc[0], dict):
+        t = np.array([row.get("time") or row.get("t") or 0 for row in ohlc], dtype=float)
+        o = np.array([float(row.get("open")) for row in ohlc], dtype=float)
+        h = np.array([float(row.get("high")) for row in ohlc], dtype=float)
+        l = np.array([float(row.get("low")) for row in ohlc], dtype=float)
+        c = np.array([float(row.get("close")) for row in ohlc], dtype=float)
+    else:
+        # [ts, open, high, low, close]
+        t = np.array([float(r[0]) for r in ohlc], dtype=float)
+        o = np.array([float(r[1]) for r in ohlc], dtype=float)
+        h = np.array([float(r[2]) for r in ohlc], dtype=float)
+        l = np.array([float(r[3]) for r in ohlc], dtype=float)
+        c = np.array([float(r[4]) for r in ohlc], dtype=float)
+
+    return t, o, h, l, c
+
+
+def _ema(x: np.ndarray, period: int) -> np.ndarray:
+    if period <= 1:
+        return x.copy()
     k = 2.0 / (period + 1.0)
-    out = [values[0]]
-    for i in range(1, len(values)):
-        out.append(out[-1] + k * (values[i] - out[-1]))
-    return out
+    ema = np.empty_like(x)
+    ema[:] = np.nan
+    ema[0] = x[0]
+    for i in range(1, len(x)):
+        ema[i] = x[i] * k + ema[i - 1] * (1 - k)
+    return ema
 
-def _sma(values: List[float], period: int) -> List[float]:
-    out = []
-    s = 0.0
-    for i, v in enumerate(values):
-        s += v
-        if i >= period:
-            s -= values[i-period]
-        if i >= period-1:
-            out.append(s/period)
-        else:
-            out.append(float('nan'))
-    return out
 
-def _diff(a: List[float], b: List[float]) -> List[float]:
-    return [ (a[i]-b[i]) if (i < len(a) and i < len(b)) else float('nan') for i in range(max(len(a), len(b))) ]
+# ==========================
+# Indicadores
+# ==========================
+def ta_rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
+    delta = np.diff(close, prepend=close[0])
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    ema_up = _ema(up, period)
+    ema_down = _ema(down, period)
+    rs = ema_up / np.maximum(1e-12, ema_down)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
 
-def _rsi(closes: List[float], period: int = 14) -> List[float]:
-    if len(closes) < period + 1:
-        return [float('nan')] * len(closes)
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        gains.append(max(0.0, ch))
-        losses.append(max(0.0, -ch))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    rsis = [float('nan')] * len(closes)
-    # primeira posição válida é no índice period
-    rsis[period] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain/avg_loss)))
-    for i in range(period+1, len(closes)):
-        gain = gains[i-1]
-        loss = losses[i-1]
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        rsis[i] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain/avg_loss)))
-    return rsis
 
-def _macd(closes: List[float], fast: int=12, slow: int=26, sig: int=9):
-    ema_fast = _ema(closes, fast)
-    ema_slow = _ema(closes, slow)
-    macd_line = [ema_fast[i] - ema_slow[i] for i in range(len(closes))]
-    signal = _ema(macd_line, sig)
-    hist = [macd_line[i] - signal[i] for i in range(len(closes))]
-    return macd_line, signal, hist
+def ta_macd(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ema_fast = _ema(close, fast)
+    ema_slow = _ema(close, slow)
+    macd = ema_fast - ema_slow
+    sig = _ema(macd, signal)
+    hist = macd - sig
+    return macd, sig, hist
 
-def _bollinger(closes: List[float], period: int=20, ndev: float=2.0):
-    sma = _sma(closes, period)
-    stds = []
-    from collections import deque
-    window = deque()
-    s = 0.0
-    s2 = 0.0
-    for i, v in enumerate(closes):
-        window.append(v)
-        s += v
-        s2 += v*v
-        if len(window) > period:
-            old = window.popleft()
-            s -= old
-            s2 -= old*old
-        if len(window) == period:
-            mean = s / period
-            var = max(0.0, (s2/period) - (mean*mean))
-            stds.append(math.sqrt(var))
-        else:
-            stds.append(float('nan'))
-    upper = [ (sma[i] + ndev*stds[i]) if not math.isnan(sma[i]) and not math.isnan(stds[i]) else float('nan') for i in range(len(closes)) ]
-    lower = [ (sma[i] - ndev*stds[i]) if not math.isnan(sma[i]) and not math.isnan(stds[i]) else float('nan') for i in range(len(closes)) ]
-    return lower, sma, upper
 
-def _true_range(h: List[float], l: List[float], c: List[float]) -> List[float]:
-    tr = [float('nan')]
-    for i in range(1, len(c)):
-        tr.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+def ta_bb(close: np.ndarray, period: int = 20, devs: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(close) < period:
+        m = np.full_like(close, np.nan)
+        s = np.full_like(close, np.nan)
+    else:
+        m = np.convolve(close, np.ones(period), 'same') / period
+        # std simples (janela centrada aproximada)
+        # para bordas, calcula std de janela válida
+        s = np.array([np.std(close[max(0, i - period // 2):min(len(close), i + period // 2 + 1)]) for i in range(len(close))])
+    upper = m + devs * s
+    lower = m - devs * s
+    return m, upper, lower
+
+
+def ta_stochrsi(close: np.ndarray, rsi_period: int = 14, stoch_period: int = 14, smoothK: int = 3, smoothD: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    rsi = ta_rsi(close, rsi_period)
+    min_r = np.array([np.min(rsi[max(0, i - stoch_period + 1):i + 1]) for i in range(len(rsi))])
+    max_r = np.array([np.max(rsi[max(0, i - stoch_period + 1):i + 1]) for i in range(len(rsi))])
+    denom = np.maximum(1e-12, (max_r - min_r))
+    stoch = (rsi - min_r) / denom
+    k = _ema(stoch, smoothK)
+    d = _ema(k, smoothD)
+    return k, d
+
+
+def ta_true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum.reduce([
+        high - low,
+        np.abs(high - prev_close),
+        np.abs(low - prev_close)
+    ])
     return tr
 
-def _atr(h: List[float], l: List[float], c: List[float], period: int=14) -> List[float]:
-    tr = _true_range(h,l,c)
-    # usa EMA do TR
-    atr = []
-    alpha = 1.0/period
-    prev = None
-    for v in tr:
-        if math.isnan(v):
-            atr.append(float('nan'))
-        else:
-            if prev is None:
-                prev = v
-            else:
-                prev = prev + alpha*(v - prev)
-            atr.append(prev)
-    return atr
 
-def _adx(h: List[float], l: List[float], c: List[float], period: int=14):
-    # +DM / -DM
-    plus_dm, minus_dm, tr = [], [], []
-    for i in range(len(c)):
-        if i == 0:
-            plus_dm.append(0.0); minus_dm.append(0.0)
-            tr.append(0.0)
-        else:
-            up = h[i] - h[i-1]
-            dw = l[i-1] - l[i]
-            plus_dm.append(up if (up > dw and up > 0) else 0.0)
-            minus_dm.append(dw if (dw > up and dw > 0) else 0.0)
-            tr.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+def ta_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    tr = ta_true_range(high, low, close)
+    return _ema(tr, period)
 
-    def _ema_arr(a: List[float], p: int) -> List[float]:
-        k = 2.0/(p+1.0)
-        out = []
-        prev = None
-        for v in a:
-            if prev is None:
-                prev = v
-            else:
-                prev = prev + k*(v-prev)
-            out.append(prev)
-        return out
 
-    atr = _ema_arr(tr, period)
-    pdi = [ (plus_dm[i]/atr[i]*100.0) if atr[i] > 0 else 0.0 for i in range(len(c)) ]
-    mdi = [ (minus_dm[i]/atr[i]*100.0) if atr[i] > 0 else 0.0 for i in range(len(c)) ]
-    dx  = [ (abs(pdi[i]-mdi[i])/(pdi[i]+mdi[i])*100.0) if (pdi[i]+mdi[i])>0 else 0.0 for i in range(len(c)) ]
-    # suaviza DX para virar ADX
-    adx = _ema_arr(dx, period)
-    return pdi, mdi, adx
+def ta_dmi_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    up_move = high - np.roll(high, 1)
+    down_move = np.roll(low, 1) - low
+    up_move[0] = 0.0
+    down_move[0] = 0.0
 
-def _cci(h: List[float], l: List[float], c: List[float], period: int=20) -> List[float]:
-    tp = [ (h[i]+l[i]+c[i])/3.0 for i in range(len(c)) ]
-    sma_tp = _sma(tp, period)
-    dev = []
-    from collections import deque
-    window = deque()
-    for i, v in enumerate(tp):
-        window.append(v)
-        if len(window) > period:
-            window.popleft()
-        if len(window) == period and not math.isnan(sma_tp[i]):
-            mean = sma_tp[i]
-            mean_dev = sum(abs(x-mean) for x in list(window)) / period
-            dev.append(mean_dev)
-        else:
-            dev.append(float('nan'))
-    cci = []
-    for i in range(len(c)):
-        if math.isnan(sma_tp[i]) or math.isnan(dev[i]) or dev[i] == 0:
-            cci.append(float('nan'))
-        else:
-            cci.append( (tp[i]-sma_tp[i]) / (0.015*dev[i]) )
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    atr = ta_atr(high, low, close, period)
+    plus_di = 100.0 * _ema(plus_dm, period) / np.maximum(1e-12, atr)
+    minus_di = 100.0 * _ema(minus_dm, period) / np.maximum(1e-12, atr)
+
+    dx = 100.0 * np.abs(plus_di - minus_di) / np.maximum(1e-12, (plus_di + minus_di))
+    adx = _ema(dx, period)
+    return plus_di, minus_di, adx
+
+
+def ta_cci(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 20) -> np.ndarray:
+    tp = (high + low + close) / 3.0
+    ma = np.convolve(tp, np.ones(period), 'same') / period
+    md = np.array([np.mean(np.abs(tp[max(0, i - period // 2):min(len(tp), i + period // 2 + 1)] - ma[i])) for i in range(len(tp))])
+    cci = (tp - ma) / np.maximum(1e-12, 0.015 * md)
     return cci
 
-# =========================
-# Normalização de OHLC do seu fetcher
-# Espera lista de dicts: {"time","open","high","low","close"}
-# =========================
-def _to_columns(ohlc: List[Dict[str, Any]]):
-    o = [float(x["open"])  for x in ohlc]
-    h = [float(x["high"])  for x in ohlc]
-    l = [float(x["low"])   for x in ohlc]
-    c = [float(x["close"]) for x in ohlc]
-    return o,h,l,c
 
-# =========================
-# Score principal
-# =========================
-def score_signal(ohlc: List[Dict[str, Any]]) -> float:
-    """Retorna um score 0..1 combinando vários indicadores."""
-    try:
-        o,h,l,c = _to_columns(ohlc)
-        n = len(c)
-        if n < 40:
-            return 0.0
+def ta_ichimoku(high: np.ndarray, low: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Tenkan (9), Kijun (26), Senkou A (deslocado, mas aqui só o valor atual)
+    def _mid(h, l, p):
+        return (np.array([np.max(h[max(0, i - p + 1):i + 1]) for i in range(len(h))]) +
+                np.array([np.min(l[max(0, i - p + 1):i + 1]) for i in range(len(l))])) / 2.0
 
-        # Indicadores
-        rsi = _rsi(c, 14)
-        macd, macd_sig, macd_hist = _macd(c)
-        ema20 = _ema(c, 20)
-        ema50 = _ema(c, 50)
-        bb_lo, bb_mid, bb_hi = _bollinger(c, 20, 2.0)
-        if EN_STOCHRSI:
-            # StochRSI (K e D)
-            rsi14 = _rsi(c, 14)
-            # normaliza rsi 0..1 com janela 14
-            k_vals = []
-            for i in range(n):
-                j0 = max(0, i-13)
-                win = [x for x in rsi14[j0:i+1] if not math.isnan(x)]
-                if len(win) < 1:
-                    k_vals.append(float('nan'))
-                else:
-                    mn = min(win); mx = max(win)
-                    k_vals.append( ( (rsi14[i]-mn)/(mx-mn) ) if (mx>mn) else 0.0 )
-            d_vals = _sma([x if not math.isnan(x) else 0.0 for x in k_vals], 3)
-        else:
-            k_vals = [float('nan')]*n
-            d_vals = [float('nan')]*n
+    tenkan = _mid(high, low, 9)
+    kijun = _mid(high, low, 26)
+    senkou_a = (tenkan + kijun) / 2.0  # (Senkou B exigiria período 52 + shift)
+    return tenkan, kijun, senkou_a
 
-        if EN_ADX:
-            pdi, mdi, adx = _adx(h,l,c,14)
-        else:
-            pdi, mdi, adx = ([float('nan')]*n,)*3
 
-        if EN_ATR:
-            atr = _atr(h,l,c,14)
-        else:
-            atr = [float('nan')]*n
+def ta_obv(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+    # Volume pode não existir, então criamos um volume "proxy" = 1
+    if volume is None:
+        volume = np.ones_like(close)
+    sign = np.sign(np.diff(close, prepend=close[0]))
+    obv = np.cumsum(sign * volume)
+    return obv
 
-        if EN_CCI:
-            cci = _cci(h,l,c,20)
-        else:
-            cci = [float('nan')]*n
 
-        i = n-1  # vela atual
-        close = c[i]
+def ta_mfi(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, period: int = 14) -> np.ndarray:
+    if volume is None:
+        volume = np.ones_like(close)
+    tp = (high + low + close) / 3.0
+    raw = tp * volume
+    pos = np.where(tp > np.roll(tp, 1), raw, 0.0)
+    neg = np.where(tp < np.roll(tp, 1), raw, 0.0)
+    pos[0] = neg[0] = 0.0
+    pos_sum = np.array([np.sum(pos[max(0, i - period + 1):i + 1]) for i in range(len(pos))])
+    neg_sum = np.array([np.sum(neg[max(0, i - period + 1):i + 1]) for i in range(len(neg))])
+    mfr = pos_sum / np.maximum(1e-12, neg_sum)
+    mfi = 100.0 - (100.0 / (1.0 + mfr))
+    return mfi
 
-        # Sub-scores 0..1
-        sub_scores = []
-        weights    = []
 
-        # RSI: quanto acima de 50 (até 90)
-        if not math.isnan(rsi[i]):
-            rsi_comp = _clamp((rsi[i]-50.0)/40.0, 0.0, 1.0)
-            sub_scores.append(rsi_comp); weights.append(W_RSI)
+def ta_willr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    highest = np.array([np.max(high[max(0, i - period + 1):i + 1]) for i in range(len(high))])
+    lowest = np.array([np.min(low[max(0, i - period + 1):i + 1]) for i in range(len(low))])
+    willr = -100.0 * (highest - close) / np.maximum(1e-12, (highest - lowest))
+    return willr
 
-        # MACD: linha acima do sinal e hist positivo
-        macd_comp = 1.0 if (macd[i] > macd_sig[i] and macd_hist[i] > 0) else (0.5 if macd[i] > macd_sig[i] else 0.0)
-        sub_scores.append(macd_comp); weights.append(W_MACD)
 
-        # EMAs: tendência curta > longa e preço acima da ema20
-        if not math.isnan(ema20[i]) and not math.isnan(ema50[i]):
-            ema_comp = 1.0 if (ema20[i] > ema50[i] and close > ema20[i]) else 0.0
-            sub_scores.append(ema_comp); weights.append(W_EMA)
+# ==========================
+# Normalização de indicadores -> score 0..1
+# ==========================
+def _z01(x: float, lo: float, hi: float) -> float:
+    return max(0.0, min(1.0, (x - lo) / max(1e-12, (hi - lo))))
 
-        # BB: acima da banda média (tendência), mas não muito esticado (abaixo da upper)
-        if not math.isnan(bb_mid[i]) and not math.isnan(bb_hi[i]):
-            if close >= bb_mid[i] and close <= bb_hi[i]:
-                bb_comp = 1.0
-            elif close > bb_hi[i]:
-                bb_comp = 0.4  # overbought/esticado
-            else:
-                bb_comp = 0.0
-            sub_scores.append(bb_comp); weights.append(W_BB)
 
-        # StochRSI: cruzamento K>D e K < 0.8
-        if EN_STOCHRSI and (not math.isnan(k_vals[i]) and not math.isnan(d_vals[i])):
-            stoch_comp = 1.0 if (k_vals[i] > d_vals[i] and k_vals[i] < 0.8) else 0.0
-            sub_scores.append(stoch_comp); weights.append(W_STOCHRSI)
-
-        # ADX: força de tendência +DI > -DI e ADX > 20
-        if EN_ADX and (not math.isnan(adx[i])):
-            adx_comp = 1.0 if (adx[i] > 20.0 and pdi[i] > mdi[i]) else 0.0
-            sub_scores.append(adx_comp); weights.append(W_ADX)
-
-        # ATR (opcional): menor volatilidade relativa favorece score (mais “limpo”)
-        if EN_ATR and (not math.isnan(atr[i]) and close > 0):
-            atr_rel = atr[i] / close  # ~0.005 é ok; acima de 0.02 muito volátil
-            atr_comp = _clamp( (0.02 - atr_rel) / 0.02, 0.0, 1.0 )
-            sub_scores.append(atr_comp); weights.append(W_ATR)
-
-        # CCI: acima de 0 tende positivo
-        if EN_CCI and (not math.isnan(cci[i])):
-            cci_comp = 1.0 if cci[i] > 0 else 0.0
-            sub_scores.append(cci_comp); weights.append(W_CCI)
-
-        total_w = sum(w for w in weights if w > 0)
-        if total_w <= 0:
-            return 0.0
-        score = sum(sub_scores[j]*weights[j] for j in range(len(sub_scores))) / total_w
-        score = _clamp(score, 0.0, 1.0)
-
-        if DEBUG_IND:
-            print(f"[IND] close={round(close,6)} | rsi={round(rsi[i],2) if not math.isnan(rsi[i]) else None} | "
-                  f"macd={round(macd[i],6)}>{round(macd_sig[i],6)} hist={round(macd_hist[i],6)} | "
-                  f"ema20={round(ema20[i],6)} ema50={round(ema50[i],6)} | "
-                  f"bb_mid={round(bb_mid[i],6) if not math.isnan(bb_mid[i]) else None} "
-                  f"bb_hi={round(bb_hi[i],6) if not math.isnan(bb_hi[i]) else None} | "
-                  f"stochK={round(k_vals[i],3) if not math.isnan(k_vals[i]) else None} "
-                  f"stochD={round(d_vals[i],3) if not math.isnan(d_vals[i]) else None} | "
-                  f"adx={round(adx[i],2) if EN_ADX else None} pdi={round(pdi[i],2) if EN_ADX else None} mdi={round(mdi[i],2) if EN_ADX else None} | "
-                  f"atr_rel={round((atr[i]/close),4) if EN_ATR and close>0 and not math.isnan(atr[i]) else None} | "
-                  f"cci={round(cci[i],2) if EN_CCI else None} | "
-                  f"score={round(score*100,1)}%")
-
-        return float(score)
-
-    except Exception as e:
-        if DEBUG_IND:
-            print(f"[IND] erro em score_signal: {e}")
-        return 0.0
-
-# =========================
-# Geração de sinal simples
-# =========================
-def generate_signal(ohlc: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _score_from_indicators(data: Dict[str, Any]) -> float:
     """
-    Estratégia básica: entrada no close atual; TP/SL por ATR (se disponível) ou 1.5%/0.75%.
+    Converte indicadores "atuais" (última barra) em [0..1] com base em regrinhas simples.
     """
-    o,h,l,c = _to_columns(ohlc)
-    i = len(c) - 1
-    price = float(c[i])
+    s = 0.0
+    w = 0.0
 
-    # ATR para dimensionar SL/TP, se disponível
-    atr = _atr(h,l,c,14)
-    if not math.isnan(atr[i]) and atr[i] > 0:
-        sl = price - 1.0 * atr[i]
-        tp = price + 2.0 * atr[i]
-        rr = (tp - price) / (price - sl) if (price - sl) > 0 else 2.0
+    # RSI (70 sobrecompra, 30 sobrevenda) – dá score alto se em tendência “saudável” (40~60)
+    rsi = data["rsi"]
+    rsi_score = 1.0 - abs((rsi - 50.0) / 50.0)  # pico em 50
+    s += rsi_score * W_RSI; w += W_RSI
+
+    # MACD: hist > 0 é bom; normaliza pela amplitude recente
+    hist = data["macd_hist"]
+    macd_score = _z01(hist, data.get("hist_min", -1.0), data.get("hist_max", 1.0))
+    s += macd_score * W_MACD; w += W_MACD
+
+    # EMAs: ema20 > ema50 e preço acima da ema20
+    ema_ok = 0.0
+    if data["ema20"] > data["ema50"] and data["close"] > data["ema20"]:
+        ema_ok = 1.0
+    elif data["ema20"] > data["ema50"] or data["close"] > data["ema20"]:
+        ema_ok = 0.6
+    s += ema_ok * W_EMA; w += W_EMA
+
+    # Bollinger: se o preço está próximo da banda média e não “espremido”
+    bb_mid = data["bb_mid"]
+    bb_hi = data["bb_hi"]
+    bb_lo = data["bb_lo"]
+    if (bb_hi is not None) and (bb_lo is not None) and (bb_mid is not None):
+        width = (bb_hi - bb_lo) / max(1e-12, bb_mid)
+        mid_dist = 1.0 - min(1.0, abs(data["close"] - bb_mid) / max(1e-12, (bb_hi - bb_lo)))
+        bb_score = 0.5 * _z01(width, 0.02, 0.12) + 0.5 * mid_dist
     else:
-        # fallback fixo
-        tp = price * 1.015
-        sl = price * 0.9925
-        rr = 2.0
+        bb_score = 0.5
+    s += bb_score * W_BB; w += W_BB
+
+    # StochRSI
+    if EN_STOCHRSI:
+        stK = data["stochK"]; stD = data["stochD"]
+        st_score = 1.0 - abs(stK - 0.5) * 2.0  # pico em 0.5
+        st_score = 0.5 * st_score + 0.5 * (1.0 - abs(stD - 0.5) * 2.0)
+        s += st_score * W_STOCHRSI; w += W_STOCHRSI
+
+    # ADX / DMI
+    if EN_ADX:
+        adx = data["adx"]; pdi = data["pdi"]; mdi = data["mdi"]
+        trend = _z01(adx, 15, 35)
+        dir_ok = 1.0 if pdi > mdi else 0.4
+        adx_score = 0.6 * trend + 0.4 * dir_ok
+        s += adx_score * W_ADX; w += W_ADX
+
+    # ATR (volatilidade moderada é melhor) -> normaliza ATR/close
+    if EN_ATR and data.get("atr_rel") is not None:
+        atr_rel = data["atr_rel"]
+        # bom entre 1% e 5%
+        atr_score = 1.0 - abs(_z01(atr_rel, 0.01, 0.05) - 0.5) * 2.0
+        s += atr_score * W_ATR; w += W_ATR
+
+    # CCI (bom perto de 0, penaliza extremos)
+    if EN_CCI:
+        cci = data["cci"]
+        cci_score = 1.0 - min(1.0, abs(cci) / 200.0)
+        s += cci_score * W_CCI; w += W_CCI
+
+    # Ichimoku: preço acima da nuvem (senkou_a ~ proxy) e Tenkan > Kijun
+    if EN_ICHI:
+        ichi_ok = 0.0
+        if (data["close"] > data["senkou_a"]) and (data["tenkan"] >= data["kijun"]):
+            ichi_ok = 1.0
+        elif (data["close"] > data["senkou_a"]) or (data["tenkan"] >= data["kijun"]):
+            ichi_ok = 0.6
+        s += ichi_ok * W_ICHI; w += W_ICHI
+
+    # OBV: direção do OBV nas últimas N barras (proxy de confirmação)
+    if EN_OBV and (data.get("obv_slope") is not None):
+        obv_score = _z01(data["obv_slope"], -1.0, 1.0)
+        s += obv_score * W_OBV; w += W_OBV
+
+    # MFI: zona média é saudável (40~60)
+    if EN_MFI and (data.get("mfi") is not None):
+        mfi = data["mfi"]
+        mfi_score = 1.0 - abs((mfi - 50.0) / 50.0)
+        s += mfi_score * W_MFI; w += W_MFI
+
+    # Williams %R: próximo de -50 é “ok”
+    if EN_WILLR and (data.get("willr") is not None):
+        wr = data["willr"]  # -100..0
+        wr_score = 1.0 - abs((wr + 50.0) / 50.0)
+        s += wr_score * W_WILLR; w += W_WILLR
+
+    if w <= 1e-9:
+        return 0.0
+    return max(0.0, min(1.0, s / w))
+
+
+# ==========================
+# Score + Detalhes
+# ==========================
+def score_signal(ohlc: List[Any]) -> Tuple[float, Dict[str, Any]]:
+    """
+    Retorna (score_0_1, details_dict) e imprime bloco [IND] se DEBUG_INDICATORS.
+    """
+    t, o, h, l, c = _to_arrays(ohlc)
+
+    # Volume não está no dataset original → usa proxy
+    volume = np.ones_like(c)
+
+    rsi = ta_rsi(c, 14)
+    macd, macd_sig, macd_hist = ta_macd(c, 12, 26, 9)
+    ema20 = _ema(c, 20)
+    ema50 = _ema(c, 50)
+    bb_mid, bb_hi, bb_lo = ta_bb(c, 20, 2.0)
+
+    stochK = stochD = np.full_like(c, np.nan)
+    if EN_STOCHRSI:
+        stochK, stochD = ta_stochrsi(c, 14, 14, 3, 3)
+
+    pdi = mdi = adx = np.full_like(c, np.nan)
+    if EN_ADX:
+        pdi, mdi, adx = ta_dmi_adx(h, l, c, 14)
+
+    atr_rel = None
+    if EN_ATR:
+        atr = ta_atr(h, l, c, 14)
+        atr_rel = float(atr[-1] / max(1e-12, c[-1]))
+
+    cci = None
+    if EN_CCI:
+        cci = float(ta_cci(h, l, c, 20)[-1])
+
+    tenkan = kijun = senkou_a = np.full_like(c, np.nan)
+    if EN_ICHI:
+        tenkan, kijun, senkou_a = ta_ichimoku(h, l)
+
+    obv_slope = None
+    if EN_OBV:
+        obv = ta_obv(c, volume)
+        # slope nos últimos 10 períodos (normalizado)
+        if len(obv) >= 11:
+            dy = obv[-1] - obv[-11]
+            mx = np.max(np.abs(obv[-11:] - np.mean(obv[-11:])))
+            obv_slope = float(dy / max(1e-9, mx))
+
+    mfi_val = None
+    if EN_MFI:
+        mfi_val = float(ta_mfi(h, l, c, volume, 14)[-1])
+
+    willr_val = None
+    if EN_WILLR:
+        willr_val = float(ta_willr(h, l, c, 14)[-1])
+
+    # faixa dinâmica do hist para normalização
+    hist_min = float(np.nanmin(macd_hist[-60:])) if len(macd_hist) >= 60 else float(np.nanmin(macd_hist))
+    hist_max = float(np.nanmax(macd_hist[-60:])) if len(macd_hist) >= 60 else float(np.nanmax(macd_hist))
+
+    details = {
+        "close": float(c[-1]),
+        "rsi": float(rsi[-1]),
+        "macd": float(macd[-1]),
+        "macd_sig": float(macd_sig[-1]),
+        "macd_hist": float(macd_hist[-1]),
+        "hist_min": hist_min,
+        "hist_max": hist_max,
+        "ema20": float(ema20[-1]),
+        "ema50": float(ema50[-1]),
+        "bb_mid": float(bb_mid[-1]) if not np.isnan(bb_mid[-1]) else None,
+        "bb_hi": float(bb_hi[-1]) if not np.isnan(bb_hi[-1]) else None,
+        "bb_lo": float(bb_lo[-1]) if not np.isnan(bb_lo[-1]) else None,
+        "stochK": float(stochK[-1]) if EN_STOCHRSI and not np.isnan(stochK[-1]) else None,
+        "stochD": float(stochD[-1]) if EN_STOCHRSI and not np.isnan(stochD[-1]) else None,
+        "pdi": float(pdi[-1]) if EN_ADX and not np.isnan(pdi[-1]) else 0.0,
+        "mdi": float(mdi[-1]) if EN_ADX and not np.isnan(mdi[-1]) else 0.0,
+        "adx": float(adx[-1]) if EN_ADX and not np.isnan(adx[-1]) else 0.0,
+        "atr_rel": atr_rel,
+        "cci": cci,
+        "tenkan": float(tenkan[-1]) if EN_ICHI and not np.isnan(tenkan[-1]) else 0.0,
+        "kijun": float(kijun[-1]) if EN_ICHI and not np.isnan(kijun[-1]) else 0.0,
+        "senkou_a": float(senkou_a[-1]) if EN_ICHI and not np.isnan(senkou_a[-1]) else 0.0,
+        "obv_slope": obv_slope,
+        "mfi": mfi_val,
+        "willr": willr_val,
+    }
+
+    score = _score_from_indicators(details)
+
+    if DEBUG_INDICATORS:
+        def _fmt(x):
+            return "None" if x is None else (f"{x:.2f}" if isinstance(x, (int, float)) else str(x))
+        print(
+            "[IND] "
+            f"close={_fmt(details['close'])} | "
+            f"rsi={_fmt(details['rsi'])} | "
+            f"macd={_fmt(details['macd']):s}>{_fmt(details['macd_sig'])} "
+            f"hist={_fmt(details['macd_hist'])} | "
+            f"ema20={_fmt(details['ema20'])} ema50={_fmt(details['ema50'])} | "
+            f"bb_mid={_fmt(details['bb_mid'])} bb_hi={_fmt(details['bb_hi'])} | "
+            f"stochK={_fmt(details['stochK'])} stochD={_fmt(details['stochD'])} | "
+            f"adx={_fmt(details['adx'])} pdi={_fmt(details['pdi'])} mdi={_fmt(details['mdi'])} | "
+            f"atr_rel={_fmt(details['atr_rel'])} | "
+            f"cci={_fmt(details['cci'])} | "
+            f"ichiT={_fmt(details['tenkan'])} kijun={_fmt(details['kijun'])} sa={_fmt(details['senkou_a'])} | "
+            f"obv_slope={_fmt(details['obv_slope'])} | "
+            f"mfi={_fmt(details['mfi'])} | "
+            f"willr={_fmt(details['willr'])} | "
+            f"score={score*100:.1f}%"
+        )
+
+    return score, details
+
+
+# ==========================
+# Geração do Plano (entry/tp/sl)
+# ==========================
+def generate_signal(ohlc: List[Any]) -> Dict[str, Any]:
+    """
+    Gera um plano simples de trade a partir da última barra:
+      - entry = close
+      - tp/sl baseados em ATR (se disponível) ou largura de BB
+      - rr padrão 2.0
+    """
+    _, _, h, l, c = _to_arrays(ohlc)
+    close = float(c[-1])
+
+    # Volatilidade de referência
+    atr_val = None
+    if EN_ATR:
+        atr = ta_atr(h, l, c, 14)
+        atr_val = float(atr[-1])
+
+    if atr_val is None or atr_val <= 0:
+        bb_mid, bb_hi, bb_lo = ta_bb(c, 20, 2.0)
+        if not np.isnan(bb_hi[-1]) and not np.isnan(bb_lo[-1]):
+            atr_val = float((bb_hi[-1] - bb_lo[-1]) / 4.0)  # proxy
+        else:
+            atr_val = close * 0.01  # fallback 1%
+
+    rr = 2.0
+    sl = close - atr_val
+    tp = close + rr * atr_val
 
     return {
-        "entry": price,
+        "entry": close,
         "tp": tp,
         "sl": sl,
         "rr": rr,
-        "strategy": "RSI+MACD+EMA+BB+STOCH+ADX+CCI"
+        "strategy": "RSI+MACD+EMA+BB+STOCHRSI+ADX+CCI+ICHI+OBV+MFI+WILLR",
+        "created_at": _ts(),
+        "id": f"sig-{int(time.time())}",
     }
