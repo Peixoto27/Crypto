@@ -10,6 +10,7 @@ main.py — pipeline principal
 - Gera sinal (entry/tp/sl) quando houver
 - Evita duplicados via positions_manager
 - Envia para o Telegram e grava em signals.json
+- (Novo) Salva histórico de snapshots e scores via history_manager (opcional)
 """
 
 import os
@@ -24,6 +25,20 @@ from apply_strategies import generate_signal, score_signal
 from notifier_telegram import send_signal_notification
 from positions_manager import should_send_and_register
 from signal_generator import append_signal  # salva no signals.json
+
+# ---- Histórico (opcional; no-op se ausente) ----
+HISTORY_ENABLED = os.getenv("HISTORY_ENABLED", "true").lower() == "true"
+HISTORY_MAX_CANDLES = int(os.getenv("HISTORY_MAX_CANDLES", "200"))
+try:
+    # você pode implementar essas funções no history_manager:
+    #   log_snapshot(symbol: str, candles: List[dict], meta: dict) -> None
+    #   log_score(row: dict) -> None
+    from history_manager import log_snapshot, log_score  # type: ignore
+except Exception:
+    def log_snapshot(symbol: str, candles: List[Dict[str, float]], meta: Dict[str, Any]) -> None:
+        pass
+    def log_score(row: Dict[str, Any]) -> None:
+        pass
 
 # ---- Sentimento (opcional; se não existir continua normal) ----
 try:
@@ -45,8 +60,8 @@ SELECT_PER_CYCLE  = int(os.getenv("SELECT_PER_CYCLE", "8"))        # quantas moe
 DAYS_OHLC         = int(os.getenv("DAYS_OHLC", "14"))              # janela em dias no CoinGecko
 MIN_BARS          = int(os.getenv("MIN_BARS", "84"))               # mínimo de candles aceitos
 
-SCORE_THRESHOLD   = float(os.getenv("SCORE_THRESHOLD", "0.70"))    # limiar técnico
-MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.60"))     # limiar de confiança final
+SCORE_THRESHOLD   = float(os.getenv("SCORE_THRESHOLD", "0.70"))    # limiar técnico (0..1)
+MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "0.60"))     # limiar confiança final (0..1)
 
 # anti-duplicados
 COOLDOWN_HOURS        = float(os.getenv("COOLDOWN_HOURS", "6"))
@@ -54,7 +69,7 @@ CHANGE_THRESHOLD_PCT  = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
 
 # mistura técnica + sentimento
 WEIGHT_TECH = float(os.getenv("WEIGHT_TECH", "1.0"))
-WEIGHT_SENT = float(os.getenv("WEIGHT_SENT", "0.0"))   # 0.0 = ignorar sentimento
+WEIGHT_SENT = float(os.getenv("WEIGHT_SENT", "0.5"))   # 0.0 = ignorar sentimento
 
 # arquivos utilitários
 DATA_RAW_FILE  = os.getenv("DATA_RAW_FILE",  os.getenv("ARQUIVO_DADOS_BRUTOS", "data_raw.json"))
@@ -220,6 +235,14 @@ def run_pipeline():
             print(f"[IND] {sym}: OHLC vazio após normalização.")
             continue
 
+        # (novo) snapshot de histórico
+        if HISTORY_ENABLED:
+            try:
+                snap = ohlc[-HISTORY_MAX_CANDLES:] if HISTORY_MAX_CANDLES > 0 else ohlc
+                log_snapshot(sym, snap, {"ts": _ts(), "days": DAYS_OHLC})
+            except Exception as e:
+                print(f"[HIST] falha snapshot {sym}: {e}")
+
         # score técnico
         score = _safe_score(ohlc)
 
@@ -246,6 +269,20 @@ def run_pipeline():
         n_str = f"(n={sent_n})" if sent_n is not None else "(n=?)"
         print(f"📊 {sym} | Técnico: {tech_pct}% | Sentimento: {sent_pct}% {n_str} | "
               f"Mix(T:{WEIGHT_TECH},S:{WEIGHT_SENT}): {mix_pct}% (min {int(MIN_CONFIDENCE*100)}%)")
+
+        # (novo) trilha de scores no histórico
+        if HISTORY_ENABLED:
+            try:
+                log_score({
+                    "ts": _ts(),
+                    "symbol": sym,
+                    "score_tech": float(score),
+                    "sentiment": float(sent_val),
+                    "mixed": float(mixed),
+                    "weights": {"tech": WEIGHT_TECH, "sent": WEIGHT_SENT},
+                })
+            except Exception as e:
+                print(f"[HIST] falha log_score {sym}: {e}")
 
         # filtros de limiar
         if score < SCORE_THRESHOLD:
