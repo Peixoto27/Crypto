@@ -1,199 +1,266 @@
 # -*- coding: utf-8 -*-
 """
-notifier_v2.py — central de notificações
-- Sinal novo: envia via notifier_telegram
-- Fechamento (TP/SL/Close): varre HISTORY_FILE e envia via notifier_trade_update
-- Evita duplicatas com um "seen set" salvo em notified_updates.json
-
-Integração sugerida no main.py:
-    from history_manager import evaluate_pending_outcomes
-    from notifier_v2 import notify_new_signal, monitor_and_notify_closures
-
-    # quando gerar um novo sinal:
-    notify_new_signal(payload_dict)
-
-    # ao final do ciclo:
-    evaluate_pending_outcomes(lookahead_hours=int(os.getenv("AUTO_LABEL_LOOKAHEAD_HOURS","48")))
-    monitor_and_notify_closures()
+notifier_telegram.py — envio de mensagens para Telegram
+- Lê BOT e CHAT do ambiente (sem hardcode)
+- Formata preços em USD (apenas entrada/alvo/stop)
+- Tenta MarkdownV2 (com escape seguro) e faz fallback automático para HTML
+- Retry + backoff para lidar com 429/erros transitórios
 """
 
 import os
+import time
 import json
-from datetime import datetime
-from typing import Dict, Any, List, Set
+import requests
+from decimal import Decimal, ROUND_DOWN
 
-# módulos existentes do seu projeto
-try:
-    from notifier_telegram import send_signal_notification
-except Exception:
-    send_signal_notification = None
+# --------------------------------------------------
+# Config (via env)
+# --------------------------------------------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # pode ser @canal ou id numérico (-100xxxx)
 
-try:
-    from notifier_trade_update import send_trade_update
-except Exception:
-    send_trade_update = None
+DEFAULT_MAX_RETRIES = int(os.getenv("TG_MAX_RETRIES", "3"))
+DEFAULT_RETRY_DELAY = float(os.getenv("TG_RETRY_DELAY", "2.0"))  # segundos
 
-# ============== Config (.env / Variables) ==================
-HISTORY_FILE = os.getenv("HISTORY_FILE", "history.json")  # onde o history_manager grava
-NOTIFIED_DB  = os.getenv("NOTIFIED_UPDATES_FILE", "notified_updates.json")  # ids já notificados (TP/SL/CLOSE)
+if not BOT_TOKEN:
+    print("⚠️ TELEGRAM_BOT_TOKEN não definido.")
+if not CHAT_ID:
+    print("⚠️ TELEGRAM_CHAT_ID não definido.")
 
-# ===========================================================
-def _now_utc_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+TG_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage" if BOT_TOKEN else None
 
-def _load_json_list(path: str) -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
 
-def _load_json_set(path: str) -> Set[str]:
-    if not os.path.exists(path):
-        return set()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return set(data)
-        if isinstance(data, dict) and "ids" in data and isinstance(data["ids"], list):
-            return set(data["ids"])
-        return set()
-    except Exception:
-        return set()
-
-def _save_json_set(path: str, items: Set[str]) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(items)), f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Falha ao salvar {path}: {e}")
-
-# ===========================================================
-# API pública
-# ===========================================================
-def notify_new_signal(content: Dict[str, Any]) -> bool:
+# --------------------------------------------------
+# Utils — formatação
+# --------------------------------------------------
+def fmt_price_usd(x) -> str:
     """
-    Encaminha o payload do novo sinal para o notifier_telegram.
-    'content' deve conter: symbol, entry_price, target_price, stop_loss, rr, confidence_score, strategy, created_at, id
+    Formata número como USD, sem notação científica. Casas dinâmicas:
+    >= 1 -> 2 casas; >= 0.01 -> 4; >= 0.0001 -> 6; senão -> 8 casas.
     """
-    if send_signal_notification is None:
-        print("❌ notifier_telegram.send_signal_notification indisponível.")
-        return False
     try:
-        ok = send_signal_notification(content)
-        if ok:
-            print("✅ Sinal inicial notificado (notifier_v2).")
+        d = Decimal(str(x))
+        if d >= Decimal("1"):
+            q = d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        elif d >= Decimal("0.01"):
+            q = d.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        elif d >= Decimal("0.0001"):
+            q = d.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
         else:
-            print("❌ Falha ao notificar sinal inicial (notifier_v2).")
-        return ok
-    except Exception as e:
-        print(f"❌ Erro ao notificar sinal inicial: {e}")
+            q = d.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        s = format(q, "f")
+        s = s.rstrip("0").rstrip(".") if "." in s else s
+        return f"${s}"
+    except Exception:
+        try:
+            x = float(x)
+            return f"${x:.8f}".rstrip("0").rstrip(".")
+        except Exception:
+            return f"${x}"
+
+
+# Escape seguro para MarkdownV2 (somente onde usamos MDV2)
+_MD_V2_CHARS = [
+    "\\", "_", "*", "[", "]", "(", ")", "~", "`", ">", "#",
+    "+", "-", "=", "|", "{", "}", ".", "!"
+]
+def mdv2_escape(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    for ch in _MD_V2_CHARS:
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+# --------------------------------------------------
+# Montagem das mensagens
+# --------------------------------------------------
+def build_markdown_signal(content: dict) -> str:
+    """
+    Constrói mensagem em MarkdownV2 escapando o necessário.
+    Apenas preços recebem formatação $... (sem escapes adicionais).
+    """
+    symbol           = mdv2_escape(content.get("symbol", "—"))
+    entry_price      = fmt_price_usd(content.get("entry_price", "—"))
+    target_price     = fmt_price_usd(content.get("target_price", "—"))
+    stop_loss        = fmt_price_usd(content.get("stop_loss", "—"))
+    risk_reward      = mdv2_escape(str(content.get("risk_reward", "—")))
+    confidence_score = mdv2_escape(str(content.get("confidence_score", "—")))
+    strategy         = mdv2_escape(content.get("strategy", "—"))
+    created_at       = mdv2_escape(content.get("created_at", "—"))
+    signal_id        = mdv2_escape(content.get("id", "—"))
+
+    # OBS: não escapamos os preços (já estão formatados limpos, sem caracteres reservados),
+    # e os colocamos dentro de `code` para ficar monoespaçado sem precisar de escapes.
+    msg = (
+        f"📢 *Novo sinal* para *{symbol}*\n"
+        f"🎯 *Entrada:* `{entry_price}`\n"
+        f"🎯 *Alvo:*   `{target_price}`\n"
+        f"🛑 *Stop:*   `{stop_loss}`\n"
+        f"📊 *R:R:* {risk_reward}\n"
+        f"📈 *Confiança:* {confidence_score}%\n"
+        f"🧠 *Estratégia:* {strategy}\n"
+        f"📅 *Criado:* {created_at}\n"
+        f"🆔 *ID:* {signal_id}"
+    )
+    return msg
+
+
+def build_html_signal(content: dict) -> str:
+    """
+    Fallback em HTML — menos sensível a caracteres reservados.
+    """
+    symbol           = content.get("symbol", "—")
+    entry_price      = fmt_price_usd(content.get("entry_price", "—"))
+    target_price     = fmt_price_usd(content.get("target_price", "—"))
+    stop_loss        = fmt_price_usd(content.get("stop_loss", "—"))
+    risk_reward      = content.get("risk_reward", "—")
+    confidence_score = content.get("confidence_score", "—")
+    strategy         = content.get("strategy", "—")
+    created_at       = content.get("created_at", "—")
+    signal_id        = content.get("id", "—")
+
+    # HTML simples (sem tags especiais nos números)
+    msg = (
+        f"📢 <b>Novo sinal</b> para <b>{symbol}</b><br>"
+        f"🎯 <b>Entrada:</b> <code>{entry_price}</code><br>"
+        f"🎯 <b>Alvo:</b>   <code>{target_price}</code><br>"
+        f"🛑 <b>Stop:</b>   <code>{stop_loss}</code><br>"
+        f"📊 <b>R:R:</b> {risk_reward}<br>"
+        f"📈 <b>Confiança:</b> {confidence_score}%<br>"
+        f"🧠 <b>Estratégia:</b> {strategy}<br>"
+        f"📅 <b>Criado:</b> {created_at}<br>"
+        f"🆔 <b>ID:</b> {signal_id}"
+    )
+    return msg
+
+
+# --------------------------------------------------
+# Envio
+# --------------------------------------------------
+def _post(payload: dict, parse_mode: str, max_retries: int, retry_delay: float) -> bool:
+    """
+    POST com retry/backoff. Retorna True se ok.
+    """
+    if not TG_URL:
+        print("❌ TG_URL ausente (provável BOT_TOKEN vazio).")
         return False
 
-
-def monitor_and_notify_closures() -> Dict[str, int]:
-    """
-    Lê o HISTORY_FILE, encontra sinais que deixaram de ser 'open'
-    e envia atualização (TP/SL/CLOSE) uma única vez por id.
-    Retorna um sumário com contagens.
-    """
-    summary = {"checked": 0, "sent_tp": 0, "sent_sl": 0, "sent_close": 0, "skipped_dup": 0, "errors": 0}
-
-    if send_trade_update is None:
-        print("❌ notifier_trade_update.send_trade_update indisponível.")
-        return summary
-
-    history = _load_json_list(HISTORY_FILE)
-    seen = _load_json_set(NOTIFIED_DB)
-
-    if not history:
-        print(f"ℹ️ Sem histórico para varrer ({HISTORY_FILE}).")
-        return summary
-
-    # Normalizar para lista
-    if isinstance(history, dict) and "signals" in history:
-        records = history.get("signals", [])
-    else:
-        records = history  # assume lista direta
-
-    for rec in records:
+    attempt = 0
+    delay = retry_delay
+    while attempt < max_retries:
+        attempt += 1
         try:
-            summary["checked"] += 1
-            sig_id  = str(rec.get("id") or "")
-            label   = (rec.get("label") or rec.get("status") or "open").lower()
-            symbol  = rec.get("symbol") or rec.get("pair") or "—"
+            pld = dict(payload)
+            pld["parse_mode"] = parse_mode
+            print(f"[TG] tentativa {attempt}, modo={parse_mode} …")
+            r = requests.post(TG_URL, json=pld, timeout=10)
+            print(f"[TG] status={r.status_code}, resp={r.text[:200]}")
 
-            # só notificar quando saiu de 'open'
-            if label in ("open", "", None):
-                continue
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("ok"):
+                    return True
 
-            if not sig_id:
-                # sem id não conseguimos deduplicar
-                print(f"⚠️ Registro sem ID ignorado (symbol={symbol}, label={label}).")
-                continue
-
-            if sig_id in seen:
-                summary["skipped_dup"] += 1
-                continue
-
-            # mapear status e preço de saída
-            if label == "hit_tp":
-                status = "TP"
-                exit_price = rec.get("exit_price", rec.get("tp", None))
-            elif label == "hit_sl":
-                status = "SL"
-                exit_price = rec.get("exit_price", rec.get("sl", None))
-            else:
-                status = "CLOSE"  # expired, manual, etc.
-                exit_price = rec.get("exit_price", rec.get("last_close", rec.get("entry", None)))
-
-            entry = rec.get("entry")
-            tp    = rec.get("tp")
-            sl    = rec.get("sl")
-            rr    = rec.get("rr", 2.0)
-            pnl   = rec.get("pnl_pct", None)
-            created_at = rec.get("created_at") or rec.get("timestamp")
-            closed_at  = rec.get("closed_at")  or _now_utc_str()
-
-            # dispara o aviso
-            ok = send_trade_update(
-                symbol=symbol,
-                status=status,
-                exit_price=exit_price,
-                entry=entry,
-                tp=tp,
-                sl=sl,
-                rr=rr,
-                pnl_pct=pnl,
-                signal_id=sig_id,
-                created_at=created_at,
-                closed_at=closed_at
-            )
-
-            if ok:
-                seen.add(sig_id)
-                if status == "TP":
-                    summary["sent_tp"] += 1
-                elif status == "SL":
-                    summary["sent_sl"] += 1
+                # Caso erro sem ser 200-ok:
+                desc = data.get("description", "")
+                if "can't parse entities" in desc.lower():
+                    # erro clássico de escape no MarkdownV2
+                    return False
+            elif r.status_code == 429:
+                # rate limit — respeitar retry_after se vier
+                retry_after = 0
+                try:
+                    retry_after = r.json().get("parameters", {}).get("retry_after", 0)
+                except Exception:
+                    pass
+                if retry_after:
+                    print(f"⚠️ 429: aguardando {retry_after}s …")
+                    time.sleep(retry_after)
                 else:
-                    summary["sent_close"] += 1
+                    print(f"⚠️ 429: aguardando {delay}s …")
+                    time.sleep(delay)
+                    delay *= 2.0
+                continue
             else:
-                summary["errors"] += 1
+                # outros erros HTTP
+                if attempt < max_retries:
+                    print(f"⚠️ Erro HTTP {r.status_code}. Retry em {delay}s …")
+                    time.sleep(delay)
+                    delay *= 2.0
+                    continue
+                return False
 
-        except Exception as e:
-            print(f"❌ Erro ao processar histórico: {e}")
-            summary["errors"] += 1
+        except requests.exceptions.Timeout:
+            if attempt < max_retries:
+                print(f"⏰ Timeout. Retry em {delay}s …")
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+            return False
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                print(f"🌐 Erro de conexão: {e}. Retry em {delay}s …")
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+            return False
+    return False
 
-    # salva o set de ids notificados
-    _save_json_set(NOTIFIED_DB, seen)
 
-    print(
-        f"🔁 Monitor fechamento — "
-        f"checados: {summary['checked']} | TP: {summary['sent_tp']} | SL: {summary['sent_sl']} | "
-        f"Close: {summary['sent_close']} | duplicados: {summary['skipped_dup']} | erros: {summary['errors']}"
-    )
-    return summary
+def send_signal_notification(content, max_retries: int = None, retry_delay: float = None) -> bool:
+    """
+    Envia:
+      - dict de sinal -> monta texto com preços em USD
+      - str -> mensagem simples
+    Tenta MarkdownV2 primeiro; se falhar por parse, faz fallback em HTML.
+    """
+    if max_retries is None:
+        max_retries = DEFAULT_MAX_RETRIES
+    if retry_delay is None:
+        retry_delay = DEFAULT_RETRY_DELAY
+
+    if not BOT_TOKEN or not CHAT_ID:
+        print("❌ Telegram não configurado (BOT_TOKEN/CHAT_ID faltando).")
+        return False
+
+    if isinstance(content, dict):
+        # 1) tenta em MarkdownV2 (com escape)
+        md_text = build_markdown_signal(content)
+        payload = {"chat_id": CHAT_ID, "text": md_text, "disable_web_page_preview": True}
+        ok = _post(payload, "MarkdownV2", max_retries, retry_delay)
+        if ok:
+            return True
+
+        # 2) fallback HTML
+        html_text = build_html_signal(content)
+        payload = {"chat_id": CHAT_ID, "text": html_text, "disable_web_page_preview": True}
+        ok = _post(payload, "HTML", max_retries, retry_delay)
+        if ok:
+            print("✅ Enviado no fallback HTML.")
+            return True
+
+        print("❌ Falha ao enviar sinal (MDV2 e HTML).")
+        return False
+
+    elif isinstance(content, str):
+        # mensagem simples: tenta MarkdownV2 com escape básico
+        md_text = mdv2_escape(content)
+        payload = {"chat_id": CHAT_ID, "text": md_text}
+        ok = _post(payload, "MarkdownV2", max_retries, retry_delay)
+        if ok:
+            return True
+
+        # fallback HTML simples
+        payload = {"chat_id": CHAT_ID, "text": content}
+        ok = _post(payload, "HTML", max_retries, retry_delay)
+        if ok:
+            print("✅ Mensagem enviada no fallback HTML.")
+            return True
+
+        print("❌ Falha ao enviar mensagem simples.")
+        return False
+
+    else:
+        print("❌ Tipo de conteúdo não suportado no notifier.")
+        return False
