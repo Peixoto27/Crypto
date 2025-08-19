@@ -1,69 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-signal_generator.py
-- Camada simples para salvar/ler sinais em signals.json
-- Sanitiza valores (evita float(tuple) e outros formatos)
+signal_generator.py — wrapper estável para geração de score/sinal técnico
+Usa apply_strategies.score_signal, mas “blinda” retorno (float|dict|tuple).
 """
-import os, json
-from typing import Dict, Any, List
-from signals_model import normalize_signal  # mantém padrão único
 
-SIGNALS_FILE = os.getenv("SIGNALS_FILE", "signals.json")
+from typing import List, Dict, Any, Tuple
+from apply_strategies import score_signal as _score
 
-def _ensure_file(path: str, default):
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(default, f, ensure_ascii=False, indent=2)
-
-_ensure_file(SIGNALS_FILE, [])  # lista de sinais abertos/atuais
-
-def _num(x, default=None):
-    """
-    Converte com segurança para float:
-      - tupla/lista -> primeiro elemento numérico
-      - string -> float se possível
-      - None -> default
-    """
-    if x is None:
-        return default
-    if isinstance(x, (list, tuple)) and x:
-        return _num(x[0], default)
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, str):
-        try:
-            return float(x.strip())
-        except Exception:
-            return default
-    return default
-
-def load_signals() -> List[Dict[str, Any]]:
+def _normalize_score(val) -> float:
     try:
-        with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if isinstance(val, dict):
+            s = float(val.get("score", val.get("value", 0.0)))
+        elif isinstance(val, (tuple, list)):
+            s = float(val[0]) if val else 0.0
+        else:
+            s = float(val)
+        if s > 1.0:
+            s = s / 100.0
+        return max(0.0, min(1.0, s))
     except Exception:
-        return []
+        return 0.0
 
-def save_signals(rows: List[Dict[str, Any]]) -> None:
-    with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
-
-def append_signal(sig: Dict[str, Any]) -> None:
-    """
-    Sanitiza campos numéricos antes de normalizar/salvar
-    (previne 'float() ... not tuple').
-    """
-    # saneamento local
-    sig = dict(sig or {})
-    sig["entry"]      = _num(sig.get("entry"))
-    sig["tp"]         = _num(sig.get("tp"))
-    sig["sl"]         = _num(sig.get("sl"))
-    sig["rr"]         = _num(sig.get("rr"), 2.0)
-    sig["confidence"] = _num(sig.get("confidence"), 0.0)
-
-    # aplica formatação padrão do projeto
-    norm = normalize_signal(sig)
-
-    data = load_signals()
-    data.append(norm)
-    save_signals(data)
+def score_from_indicators(ohlc: List[Dict[str, float]]) -> float:
+    try:
+        raw = _score(ohlc)
+        return _normalize_score(raw)
+    except Exception:
+        return 0.0
