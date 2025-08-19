@@ -1,338 +1,319 @@
 # -*- coding: utf-8 -*-
-import os, json, time, math, random
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Tuple, Optional
+"""
+main.py — orquestrador do ciclo de varredura
+- Busca OHLC (CoinGecko) dos símbolos
+- Salva data_raw.json
+- Calcula score técnico e de sentimento (NewsData + Twitter, se habilitados)
+- Gera e envia sinais (se a sua generate_signal fizer isso)
+- Exposta a função run_pipeline() para o runner.py
+"""
 
-# =========================================================
-# Utils
-# =========================================================
-UTC = lambda: datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+from __future__ import annotations
+import os, json, time, math
+from datetime import datetime
+from typing import List, Dict, Any, Tuple, Optional
 
-def getenv(name: str, default: str) -> str:
-    return os.getenv(name, default)
-
-def jdump(path: str, obj: Any):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-def jload(path: str) -> Any:
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
-
-def norm_pct(x: float) -> float:
-    # aceita 0..1 ou 0..100
-    return clamp01(x/100.0 if x > 1.0 else x)
-
-# =========================================================
-# Imports dos módulos do projeto (com fallbacks)
-# =========================================================
+# =========================
+# Imports dos seus módulos
+# =========================
+# fetch_ohlc(symbol, days) deve retornar [[ts, o, h, l, c], ...]
+# fetch_top_symbols(n) retorna lista de símbolos (ex.: ["BTCUSDT", ...])
 try:
-    from data_fetcher_coingecko import fetch_ohlc, fetch_prices, COINGECKO_IDS
+    from data_fetcher_coingecko import fetch_ohlc, fetch_top_symbols
 except Exception:
     fetch_ohlc = None
-    fetch_prices = None
-    COINGECKO_IDS = {}
+    fetch_top_symbols = None
 
+# score_signal(ohlc_dicts)->float ou dict{"score":..}
+# generate_signal(ohlc_dicts)->dict com {entry,tp,sl,confidence,strategy}
 try:
     from apply_strategies import score_signal, generate_signal
 except Exception:
-    # fallbacks mínimos
-    def score_signal(ohlc: List[Dict[str, float]]):
-        # heurística boba só pra não quebrar
-        if not ohlc: return 0.0
-        closes = [b["c"] for b in ohlc[-14:]]
-        up = sum(1 for i in range(1, len(closes)) if closes[i] >= closes[i-1])
-        return up / max(1, len(closes)-1)
-    def generate_signal(ohlc: List[Dict[str,float]]):
-        if not ohlc: return None
-        last = ohlc[-1]["c"]
-        return {"entry": last, "tp": last*1.02, "sl": last*0.99}
+    def score_signal(_): return 0.0
+    def generate_signal(_): return None
 
+# analisador de sentimento (News + Twitter) – opcional
+# get_sentiment(symbol)-> dict {"score":0..1,"news_n":int,"tw_n":int}
 try:
-    from notifier_telegram import send_signal, send_info
+    from sentiment_analyzer import get_sentiment_score as _get_sentiment_core
 except Exception:
-    def send_signal(*args, **kwargs): pass
-    def send_info(*args, **kwargs): pass
+    _get_sentiment_core = None
 
-# Sentimento News (se tiver módulo próprio, usa; senão implemento simples aqui)
+# histórico local (opcional)
 try:
-    from sentiment_analyzer import get_sentiment_score as get_news_sentiment
+    from history_manager import save_cycle_ohlc
 except Exception:
-    def get_news_sentiment(symbol: str, **kw) -> Tuple[float,int]:
-        # fallback neutro
-        return (0.5, 0)
+    def save_cycle_ohlc(*args, **kwargs):  # no-op
+        return
 
-# Sentimento Twitter (módulo opcional)
+# notifier (v1 ou v2 — tanto faz o nome do arquivo, contanto que expose send_telegram_message)
 try:
-    from twitter_sentiment import get_twitter_sentiment
+    from notifier_telegram_v2 import send_telegram_message
 except Exception:
-    def get_twitter_sentiment(symbol: str, **kw) -> Tuple[float,int]:
-        return (0.5, 0)
+    try:
+        from notifier_telegram import send_telegram_message
+    except Exception:
+        def send_telegram_message(*args, **kwargs): return False, "notifier indisponível"
 
-# Histórico opcional
-try:
-    from history_manager import save_ohlc_history
-except Exception:
-    def save_ohlc_history(*args, **kwargs): pass
 
-# =========================================================
-# ENV / Config
-# =========================================================
-INTERVAL_MIN         = int(getenv("INTERVAL_MIN", "20"))
-DAYS_OHLC            = int(getenv("DAYS_OHLC", "30"))
-MIN_BARS             = int(getenv("MIN_BARS", "180"))
-SYMBOLS_ENV          = [s for s in getenv("SYMBOLS","").replace(" ","").split(",") if s]
+# =========================
+# Helpers
+# =========================
+def _ts() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-BATCH_SIZE           = int(getenv("BATCH_SIZE","8"))
-SCORE_THRESHOLD      = float(getenv("SCORE_THRESHOLD","0.70"))
+def _get_env(name: str, default: str = "") -> str:
+    return os.getenv(name, default)
 
-WEIGHT_TECH          = float(getenv("WEIGHT_TECH","1.5"))
-WEIGHT_SENT          = float(getenv("WEIGHT_SENT","1.0"))
-NEWS_WEIGHT          = float(getenv("NEWS_WEIGHT","0.6"))
-TWITTER_WEIGHT       = float(getenv("TWITTER_WEIGHT","0.4"))
+def _as_bool(val: str) -> bool:
+    return str(val).lower() in ("1", "true", "yes", "y", "on")
 
-# NewsData
-NEWS_API_URL         = getenv("NEWS_API_URL","https://newsdata.io/api/1/news")
-NEWS_API_KEY         = getenv("NEWS_API_KEY","")
-NEWS_LOOKBACK_HOURS  = int(getenv("NEWS_LOOKBACK_HOURS","12"))
-NEWS_MAX_PER_SOURCE  = int(getenv("NEWS_MAX_PER_SOURCE","5"))
-NEWS_TIMEOUT         = int(getenv("NEWS_TIMEOUT","8"))
-NEWS_LANGS           = getenv("NEWS_LANGS","en,pt")
-NEWS_CATEGORY        = getenv("NEWS_CATEGORY","business,technology")
-NEWS_CACHE_FILE      = getenv("NEWS_CACHE_FILE","news_cache.json")
-NEWS_CACHE_TTL_MIN   = int(getenv("NEWS_CACHE_TTL_MIN","30"))
-
-# Twitter/X
-TWITTER_USE          = getenv("TWITTER_USE","false").lower() in ("1","true","yes")
-TWITTER_BEARER       = getenv("TWITTER_BEARER_TOKEN","")
-TWITTER_LOOKBACK_MIN = int(getenv("TWITTER_LOOKBACK_MIN","120"))
-TWITTER_MAX_TWEETS   = int(getenv("TWITTER_MAX_TWEETS","80"))
-TWITTER_TIMEOUT      = int(getenv("TWITTER_TIMEOUT","20"))
-TWITTER_LANGS        = getenv("TWITTER_LANGS","en,pt")
-TWITTER_CACHE_TTL    = int(getenv("TWITTER_CACHE_TTL","900"))
-TWITTER_HOURLY_LIMIT = int(getenv("TWITTER_HOURLY_LIMIT","60"))
-
-# IA & Histórico
-IA_USE               = getenv("IA_USE","true").lower() in ("1","true","yes")
-SAVE_HISTORY         = getenv("SAVE_HISTORY","true").lower() in ("1","true","yes")
-HISTORY_DIR          = getenv("HISTORY_DIR","data/history")
-DATA_RAW_FILE        = getenv("DATA_RAW_FILE","data_raw.json")
-
-# =========================================================
-# OHLC helpers
-# =========================================================
-def _norm_rows(rows: Any) -> List[Dict[str,float]]:
-    out = []
-    if not rows: return out
+def _norm_rows(rows: Any) -> List[Dict[str, float]]:
+    """Normaliza [[ts,o,h,l,c],...] -> [{"t":..,"o":..,"h":..,"l":..,"c":..},...]"""
+    out: List[Dict[str, float]] = []
+    if not rows:
+        return out
     if isinstance(rows, list) and rows and isinstance(rows[0], list):
         for r in rows:
             if len(r) >= 5:
-                out.append({"t":float(r[0]),"o":float(r[1]),"h":float(r[2]),
-                            "l":float(r[3]),"c":float(r[4])})
-    elif isinstance(rows, list) and isinstance(rows[0], dict):
+                out.append({"t": float(r[0]), "o": float(r[1]), "h": float(r[2]),
+                            "l": float(r[3]), "c": float(r[4])})
+    elif isinstance(rows, list) and rows and isinstance(rows[0], dict):
         for r in rows:
-            o=float(r.get("o", r.get("open", 0.0)))
-            h=float(r.get("h", r.get("high", 0.0)))
-            l=float(r.get("l", r.get("low", 0.0)))
-            c=float(r.get("c", r.get("close", 0.0)))
-            t=float(r.get("t", r.get("time", 0.0)))
-            out.append({"t":t,"o":o,"h":h,"l":l,"c":c})
+            out.append({
+                "t": float(r.get("t", 0.0)),
+                "o": float(r.get("o", r.get("open", 0.0))),
+                "h": float(r.get("h", r.get("high", 0.0))),
+                "l": float(r.get("l", r.get("low", 0.0))),
+                "c": float(r.get("c", r.get("close", 0.0))),
+            })
     return out
 
-def collect_ohlc(symbols: List[str], days: int) -> Dict[str, List[Dict[str,float]]]:
-    data: Dict[str,List[Dict[str,float]]] = {}
-    for s in symbols:
-        try:
-            raw = fetch_ohlc(s, days) if fetch_ohlc else None
-            bars = _norm_rows(raw)
-            if len(bars) >= MIN_BARS:
-                data[s] = bars[-MIN_BARS:]
-                print(f"   → OK | candles={len(bars)}")
-                if SAVE_HISTORY:
-                    save_ohlc_history(HISTORY_DIR, s, bars)
-            else:
-                print(f"   ✖ Dados insuficientes para {s}")
-        except Exception as e:
-            msg = str(e)
-            if "429" in msg or "rate" in msg.lower():
-                delay = 30.0 if "tentativa 1" not in msg else 75.0
-                print(f"⚠️ 429: aguardando {delay:.1f}s (tentativa ?/6)")
-                time.sleep(delay)
-            else:
-                print(f"⚠️ Erro OHLC {s}: {e}")
-    return data
-
-# =========================================================
-# Sentimentos (News + Twitter) com cache
-# =========================================================
-def _load_cache(path: str) -> Dict[str, Any]:
-    obj = jload(path) or {"ts": 0, "data": {}}
-    return obj
-
-def _save_cache(path: str, obj: Dict[str, Any]):
-    jdump(path, obj)
-
-def news_sentiment(symbol: str) -> Tuple[float,int]:
-    if not NEWS_API_KEY:
-        return (0.5, 0)
-    cache = _load_cache(NEWS_CACHE_FILE)
-    now = time.time()
-    ttl = NEWS_CACHE_TTL_MIN * 60
-    key = f"{symbol}:{NEWS_LOOKBACK_HOURS}"
-    ent = cache["data"].get(key)
-    if ent and now - ent["ts"] < ttl:
-        return (float(ent["score"]), int(ent["n"]))
-
-    # usa módulo do projeto se existir (importado acima)
-    s, n = get_news_sentiment(
-        symbol=symbol,
-        api_url=NEWS_API_URL, api_key=NEWS_API_KEY,
-        lookback_hours=NEWS_LOOKBACK_HOURS,
-        max_per_source=NEWS_MAX_PER_SOURCE,
-        langs=NEWS_LANGS, category=NEWS_CATEGORY,
-        timeout=NEWS_TIMEOUT
-    )
-    s = norm_pct(s)
-    cache["data"][key] = {"ts": now, "score": s, "n": int(n)}
-    _save_cache(NEWS_CACHE_FILE, cache)
-    return (s, int(n))
-
-def twitter_sentiment(symbol: str) -> Tuple[float,int]:
-    if not TWITTER_USE or not TWITTER_BEARER:
-        return (0.5, 0)
-    cache_file = os.path.join("data", "twitter_cache.json")
-    cache = _load_cache(cache_file)
-    now = time.time()
-    ttl = TWITTER_CACHE_TTL
-    key = f"{symbol}:{TWITTER_LOOKBACK_MIN}:{TWITTER_LANGS}"
-    ent = cache["data"].get(key)
-    if ent and now - ent["ts"] < ttl:
-        return (float(ent["score"]), int(ent["n"]))
-
-    s, n = get_twitter_sentiment(
-        symbol=symbol,
-        bearer=TWITTER_BEARER,
-        lookback_min=TWITTER_LOOKBACK_MIN,
-        max_tweets=TWITTER_MAX_TWEETS,
-        langs=TWITTER_LANGS,
-        timeout=TWITTER_TIMEOUT
-    )
-    s = norm_pct(s)
-    cache["data"][key] = {"ts": now, "score": s, "n": int(n)}
-    _save_cache(cache_file, cache)
-    return (s, int(n))
-
-# =========================================================
-# Mistura e execução
-# =========================================================
-def safe_score_tech(ohlc: List[Dict[str,float]]) -> float:
+def _safe_score_tech(ohlc: List[Dict[str, float]]) -> Tuple[float, Optional[str]]:
+    """Protege contra retornos diferentes do score_signal e erros."""
     try:
-        raw = score_signal(ohlc)
-        if isinstance(raw, tuple) and len(raw)>=1:
-            val = raw[0]
-        elif isinstance(raw, dict):
-            val = raw.get("score", raw.get("value", 0.0))
+        s = score_signal(ohlc)
+        if isinstance(s, dict):
+            s = s.get("score", s.get("value", 0.0))
+        s = float(s)
+        if s > 1.0:  # caso seja porcentagem
+            s /= 100.0
+        s = max(0.0, min(1.0, s))
+        return s, None
+    except Exception as e:
+        return 0.0, f"[IND] erro em score_signal: {e}"
+
+def _get_sentiment(symbol: str) -> Tuple[float, int, int]:
+    """
+    Retorna (score, news_n, tw_n) em [0..1].
+    Se o módulo não existir, retorna 0.5 neutro, n=0.
+    """
+    # ver flags
+    news_on     = bool(_get_env("NEWS_API_KEY"))
+    twitter_on  = _as_bool(_get_env("TWITTER_USE", "false"))
+
+    if _get_sentiment_core is None or (not news_on and not twitter_on):
+        return 0.5, 0, 0
+
+    try:
+        res = _get_sentiment_core(symbol)
+        if isinstance(res, dict):
+            score  = float(res.get("score", 0.5))
+            n_news = int(res.get("news_n", 0))
+            n_tw   = int(res.get("tw_n", 0))
+        elif isinstance(res, tuple) and len(res) >= 3:
+            score, n_news, n_tw = float(res[0]), int(res[1]), int(res[2])
         else:
-            val = raw
-        return norm_pct(float(val))
+            score, n_news, n_tw = 0.5, 0, 0
+
+        # normaliza
+        if score > 1.0:
+            score /= 100.0
+        score = max(0.0, min(1.0, score))
+        return score, n_news, n_tw
     except Exception:
-        return 0.0
+        return 0.5, 0, 0
 
-def mix_scores(tech: float, s_news: float, s_tw: float) -> float:
-    # normaliza pesos do sentimento (NEWS/TW) dentro de WEIGHT_SENT
-    sent_w_total = max(1e-9, NEWS_WEIGHT + TWITTER_WEIGHT)
-    w_news = WEIGHT_SENT * (NEWS_WEIGHT / sent_w_total)
-    w_tw   = WEIGHT_SENT * (TWITTER_WEIGHT / sent_w_total)
-    num = WEIGHT_TECH*tech + w_news*s_news + w_tw*s_tw
-    den = WEIGHT_TECH + w_news + w_tw
-    return num / max(1e-9, den)
+def _print_status_header():
+    news_on     = bool(_get_env("NEWS_API_KEY"))
+    ia_on       = _as_bool(_get_env("AI_USE", "true"))
+    hist_on     = _as_bool(_get_env("SAVE_HISTORY", "true"))
+    tw_on       = _as_bool(_get_env("TWITTER_USE", "false"))
+    print(f"🔎 NEWS ativo?: {str(news_on)} | IA ativa?: {str(ia_on)} | Histórico ativado?: {str(hist_on)} | Twitter ativo?: {str(tw_on)}")
 
-def run_once():
-    print("Starting Container")
-    print(f"▶️ Runner iniciado. Intervalo = {INTERVAL_MIN:.1f} min.")
-    print(f"🔎 NEWS ativo?: {bool(NEWS_API_KEY)} | IA ativa?: {IA_USE} | Histórico ativado?: {SAVE_HISTORY} | Twitter ativo?: {TWITTER_USE}")
 
-    # universo
-    symbols = SYMBOLS_ENV[:] if SYMBOLS_ENV else ["BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","ADAUSDT","DOGEUSDT","TRXUSDT"]
-    print(f"🧪 Moedas deste ciclo ({min(BATCH_SIZE, len(symbols))}/{len(symbols)}): {', '.join(symbols[:BATCH_SIZE])}")
+# =========================
+# Núcleo do ciclo
+# =========================
+def run_pipeline():
+    """Executa UM ciclo completo. (Chamado pelo runner.py)"""
+    try:
+        interval_min = float(_get_env("INTERVAL_MIN", "20"))
+        print(f"▶️ Runner iniciado. Intervalo = {interval_min:.1f} min.")
+    except Exception:
+        print("▶️ Runner iniciado. Intervalo = 20.0 min.")
+    _print_status_header()
+
+    # Configs
+    days         = int(float(_get_env("DAYS_OHLC", "30")))
+    min_bars     = int(float(_get_env("MIN_BARS", "180")))
+    thr_mix      = float(_get_env("SCORE_THRESHOLD", "0.70"))     # limiar final para sinal
+    weight_tech  = float(_get_env("WEIGHT_TECH", "1.5"))
+    weight_sent  = float(_get_env("WEIGHT_SENT", "1.0"))
+
+    # Universo de símbolos
+    syms_env = [s for s in _get_env("SYMBOLS", "").replace(" ", "").split(",") if s]
+    if syms_env:
+        universe = syms_env
+    else:
+        n = int(_get_env("TOP_SYMBOLS", "93"))
+        universe = fetch_top_symbols(n) if fetch_top_symbols else []
+    # Remoção opcional de estáveis redundantes (ex.: FDUSDUSDT, BUSDUSDT etc.)
+    STABLE_FILTER = _as_bool(_get_env("FILTER_STABLES", "true"))
+    if STABLE_FILTER:
+        st = ("BUSDUSDT","FDUSDUSDT","USDCUSDT","TUSDUSDT","USDPUSDT","DAIUSDT")
+        removed = [s for s in universe if s in st]
+        if removed:
+            print(f"🧠 Removidos {len(removed)} pares estáveis redundantes (ex.: {removed[0]}).")
+        universe = [s for s in universe if s not in st]
+
+    # Quantos por ciclo
+    per_cycle = int(_get_env("PAIRS_PER_CYCLE", "8"))
+    # cursor simples com base na hora — suficientemente estável para produção
+    idx_base = int(datetime.utcnow().timestamp() // (interval_min*60)) if (interval_min := float(_get_env("INTERVAL_MIN", "20"))) else 0
+    start = (idx_base * per_cycle) % max(1, len(universe))
+    symbols = universe[start:start+per_cycle]
+    print(f"🧪 Moedas deste ciclo ({len(symbols)}/{len(universe)}): {', '.join(symbols) if symbols else '—'}")
+
+    if not symbols:
+        print("❌ Nenhum ativo com OHLC suficiente.")
+        print("✅ Ciclo concluído em 0s. Próxima execução")
+        return
 
     # coleta OHLC
-    print(f"📊 Coletando OHLC {symbols[0]} (days={DAYS_OHLC})…")
-    data = collect_ohlc(symbols[:BATCH_SIZE], DAYS_OHLC)
+    data_map: Dict[str, List[List[float]]] = {}
+    collected_norm: Dict[str, List[Dict[str, float]]] = {}
+    for sym in symbols:
+        try:
+            print(f"📊 Coletando OHLC {sym} (days={days})…")
+            rows = []
+            if fetch_ohlc is None:
+                raise RuntimeError("fetch_ohlc indisponível")
+            rows = fetch_ohlc(sym, days)  # esta função já implementa 429/backoff nos seus módulos
+            norm = _norm_rows(rows)
+            if len(norm) >= min_bars:
+                data_map[sym] = rows
+                collected_norm[sym] = norm
+                print(f"   → OK | candles={len(norm)}")
+            else:
+                print(f"❌ Dados insuficientes para {sym} (candles={len(norm)}/{min_bars})")
+        except Exception as e:
+            print(f"⚠️ Erro OHLC {sym}: {e}")
 
     # salva data_raw.json
-    to_save = {"symbols": list(data.keys()),
-               "created_at": UTC(),
-               "data": {s: [[b['t'],b['o'],b['h'],b['l'],b['c']] for b in bars] for s,bars in data.items()}}
-    jdump(DATA_RAW_FILE, to_save)
-    print(f"💾 Salvo {DATA_RAW_FILE} ({len(data)} ativos)")
+    if collected_norm:
+        out_json = {
+            "saved_at": _ts(),
+            "symbols": list(collected_norm.keys()),
+            "data": {k: data_map.get(k, []) for k in collected_norm.keys()}
+        }
+        with open("data_raw.json", "w", encoding="utf-8") as f:
+            json.dump(out_json, f, ensure_ascii=False)
+        print(f"💾 Salvo data_raw.json ({len(collected_norm)} ativos)")
 
-    # calcula scores
-    signals = []
-    for sym, bars in data.items():
-        past = bars
-        tscore = safe_score_tech(past)
+        # salva histórico (um arquivo por símbolo) se habilitado
+        if _as_bool(_get_env("SAVE_HISTORY", "true")):
+            try:
+                save_cycle_ohlc(collected_norm)  # history_manager.py
+            except Exception:
+                pass
+    else:
+        print("❌ Nenhum ativo válido para salvar.")
+        return
 
-        nscore, n_n = news_sentiment(sym)
-        tscore_tw, n_tw = twitter_sentiment(sym)
+    # IA / Sinais
+    ia_on = _as_bool(_get_env("AI_USE", "true"))
+    min_pct = int(round(thr_mix * 100))
+    sent_logs = _as_bool(_get_env("DEBUG_INDICATORS", "false"))
 
-        mix = mix_scores(tscore, nscore, tscore_tw)
+    saved_signals = []
+    for sym, ohlc in collected_norm.items():
+        # técnico
+        tech, tech_err = _safe_score_tech(ohlc)
+        # sentimento
+        sent, n_news, n_tw = _get_sentiment(sym)
+        # mistura
+        mix = (tech * weight_tech + sent * weight_sent) / max(1e-9, (weight_tech + weight_sent))
 
-        # log detalhado
-        print(f"[IND] {sym} | Técnico: {tscore*100:.1f}% | Sentimento: {nscore*100:.1f}% (news n={n_n}, tw n={n_tw}) | Mix(T:{WEIGHT_TECH:.1f},S:{WEIGHT_SENT:.1f}): {mix*100:.1f}% (min {int(SCORE_THRESHOLD*100)}%)")
+        pct_tech = f"{tech*100:.1f}%"
+        pct_sent = f"{sent*100:.1f}%"
+        pct_mix  = f"{mix*100:.1f}%"
 
-        if mix >= SCORE_THRESHOLD:
-            sig = generate_signal(past) or {}
-            # formata preços em USD
-            entry = float(sig.get("entry", past[-1]["c"]))
-            tp    = float(sig.get("tp", entry*1.02))
-            sl    = float(sig.get("sl", entry*0.99))
-            rr    = (tp-entry)/max(1e-9, entry-sl)
-            conf  = mix*100.0
-            signals.append({
-                "symbol": sym, "entry": entry, "tp": tp, "sl": sl,
-                "rr": round(rr,2), "confidence": round(conf,2),
-                "created_at": UTC()
+        if tech_err:
+            print(tech_err)
+
+        if sent_logs:
+            last = ohlc[-1]
+            dbg = (f"[IND] close={last['c']:.2f} | score={pct_tech}")
+            print(dbg)
+
+        print(f"[IND] {sym} | Técnico: {pct_tech} | Sentimento: {pct_sent} (news n={n_news}, tw n={n_tw}) | "
+              f"Mix(T:{weight_tech:.1f},S:{weight_sent:.1f}): {pct_mix} (min {min_pct}%)")
+
+        # sinal somente se IA ativa e mix >= threshold
+        if ia_on and mix >= thr_mix:
+            try:
+                sig = generate_signal(ohlc) or {}
+            except Exception:
+                sig = {}
+
+            # normaliza preços em USD (não notação científica)
+            entry = float(sig.get("entry", ohlc[-1]["c"]))
+            tp    = float(sig.get("tp",   entry * 1.02))
+            sl    = float(sig.get("sl",   entry * 0.99))
+            conf  = float(sig.get("confidence", mix))
+            strat = sig.get("strategy", "RSI+MACD+EMA+BB+STOCHRSI+ADX+CCI+ICHI+OBV+MFI+WILLR")
+
+            msg = (
+                f"📢 **Novo sinal** para **{sym}**\n"
+                f"🎯 **Entrada:** ${entry:.6f}\n"
+                f"🎯 **Alvo:**   ${tp:.6f}\n"
+                f"🛑 **Stop:**   ${sl:.6f}\n"
+                f"📈 **R:R:** {abs((tp-entry)/max(1e-9, entry-sl)):.1f}\n"
+                f"📊 **Confiança:** {conf*100:.2f}%\n"
+                f"🧠 **Estratégia:** {strat}\n"
+                f"🗞 **Sentimento:** {pct_sent} (news n={n_news}, tw n={n_tw})\n"
+                f"📅 **Criado:** { _ts() }"
+            )
+            ok, err = send_telegram_message(msg)
+            if not ok:
+                print(f"⚠️ Falha ao enviar Telegram: {err}")
+            saved_signals.append({
+                "symbol": sym, "created_at": _ts(),
+                "entry": entry, "tp": tp, "sl": sl,
+                "confidence": conf, "mix": mix,
+                "sentiment": sent, "news_n": n_news, "tw_n": n_tw
             })
 
-    # salva e notifica
-    jdump("signals.json", signals)
-    print(f"🗂 {len(signals)} sinais salvos em signals.json")
+    # persiste signals.json
+    with open("signals.json", "w", encoding="utf-8") as f:
+        json.dump(saved_signals, f, ensure_ascii=False, indent=2)
+    print(f"🗂 {len(saved_signals)} sinais salvos em signals.json")
+    print(f"🕒 Fim: { _ts() }")
 
-    for s in signals:
-        try:
-            send_signal(
-                symbol=s["symbol"],
-                entry=f"${s['entry']:.6f}",
-                tp=f"${s['tp']:.6f}",
-                sl=f"${s['sl']:.6f}",
-                rr=s["rr"],
-                confidence=s["confidence"],
-                strategy="RSI+MACD+EMA+BB+STOCHRSI+ADX+CCI+ICHI+OBV+MFI+WILLR",
-                created_at=s["created_at"]
-            )
-        except Exception:
-            pass
 
-    print(f"🕒 Fim: {UTC()}")
-
-def main_loop():
-    while True:
-        t0 = time.time()
-        run_once()
-        dt = max(0.0, INTERVAL_MIN*60 - (time.time()-t0))
-        # dorme em lapsos de 30s p/ logs bonitos
-        while dt > 0:
-            chunk = min(30.0, dt)
-            print(f"⏳ aguardando {int(chunk)}s… (restante {int(dt)}s)")
-            time.sleep(chunk)
-            dt -= chunk
-
+# =========================
+# Execução direta (sem runner)
+# =========================
 if __name__ == "__main__":
-    main_loop()
+    # Loop interno opcional quando rodar direto: python main.py
+    try:
+        interval_min = float(_get_env("INTERVAL_MIN", "20"))
+    except Exception:
+        interval_min = 20.0
+
+    while True:
+        run_pipeline()
+        wait = int(round(interval_min * 60))
+        print(f"✅ Ciclo concluído em {wait}s. Próxima execução")
+        time.sleep(wait)
