@@ -1,115 +1,110 @@
-# apply_strategies.py
-import math
-import os
+# -*- coding: utf-8 -*-
+"""
+apply_strategies.py — cálculo de score técnico (robusto)
+- score_signal(ohlc) NUNCA lança exceção; retorna [0..1]
+- generate_signal(ohlc) cria tp/sl básicos quando score alto
+"""
 
-# --- helpers robustos ---
-def _as_float(x, default=0.0):
-    try:
-        if x is None:
-            return default
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return default
+from typing import List, Dict, Tuple
+
+# ====== Helpers/indicadores do seu projeto ======
+# Se você já tem um _score_from_indicators em outro arquivo,
+# pode manter — aqui tem uma implementação simples e segura.
+try:
+    from indicators import rsi, macd_line, ema
+except Exception:
+    # Fallbacks triviais pra evitar import error em runtime
+    def rsi(closes, period=14):
+        if not closes or len(closes) < period + 1: return 50.0
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            d = closes[i] - closes[i-1]
+            gains.append(max(d, 0.0))
+            losses.append(max(-d, 0.0))
+        avg_gain = sum(gains[-period:]) / period if period <= len(gains) else 0.0
+        avg_loss = sum(losses[-period:]) / period if period <= len(losses) else 1e-9
+        rs = avg_gain / avg_loss if avg_loss > 0 else 0.0
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def ema(closes, period=20):
+        if not closes: return 0.0
+        k = 2.0 / (period + 1.0)
+        v = closes[0]
+        for c in closes[1:]:
+            v = c * k + v * (1.0 - k)
         return v
-    except Exception:
-        return default
 
-def _clip01(v):
-    return max(0.0, min(1.0, v))
+    def macd_line(closes, fast=12, slow=26, signal=9):
+        if not closes: return (0.0, 0.0, 0.0)
+        import math
+        def _ema(vals, p):
+            k = 2.0 / (p + 1.0)
+            v = vals[0]
+            for x in vals[1:]:
+                v = x * k + v * (1.0 - k)
+            return v
+        macd = _ema(closes, fast) - _ema(closes, slow)
+        sig  = _ema([macd]*signal, signal)  # simplificado p/ robustez
+        hist = macd - sig
+        return (macd, sig, hist)
 
-def _env_f(name, default):
+# =================================================
+
+def _score_from_indicators(ohlc: List[Dict]) -> float:
+    """
+    Score simples combinando RSI & MACD & EMA — retorna [0..1]
+    """
     try:
-        return float(os.getenv(name, str(default)))
+        closes = [b["c"] for b in ohlc if isinstance(b, dict) and "c" in b]
+        if len(closes) < 30:
+            return 0.0
+        r = rsi(closes, 14)              # 0..100
+        m, s, h = macd_line(closes)      # pode ser negativo
+        e20 = ema(closes, 20)
+        e50 = ema(closes, 50)
+
+        # Normalizações toscas mas seguras
+        r_norm = r / 100.0
+        macd_norm = 0.5 + max(-1.0, min(1.0, m * 0.001))
+        ema_norm = 0.5 + max(-1.0, min(1.0, (e20 - e50) / (abs(e50) + 1e-9))) * 0.5
+
+        s = 0.4 * r_norm + 0.3 * macd_norm + 0.3 * ema_norm
+        if s < 0.0: s = 0.0
+        if s > 1.0: s = 1.0
+        return s
     except Exception:
-        return default
+        return 0.0
 
-def _env_b(name, default=False):
-    v = os.getenv(name, str(default)).lower()
-    return v in ("1", "true", "yes", "on")
-
-# pesos / toggles (compatíveis com seu ENV)
-W_RSI      = _env_f("W_RSI",       _env_f("RSI_WEIGHT",       1.0))
-W_MACD     = _env_f("W_MACD",      _env_f("MACD_WEIGHT",      1.0))
-W_EMA      = _env_f("W_EMA",       _env_f("EMA_WEIGHT",       1.0))
-W_BB       = _env_f("W_BB",        _env_f("BB_WEIGHT",        0.7))
-W_STOCHRSI = _env_f("W_STOCHRSI",  _env_f("STOCHRSI_WEIGHT",  0.8))
-W_ADX      = _env_f("W_ADX",       _env_f("ADX_WEIGHT",       0.8))
-W_ATR      = _env_f("W_ATR",       _env_f("ATR_WEIGHT",       0.0))
-W_CCI      = _env_f("W_CCI",       _env_f("CCI_WEIGHT",       0.5))
-
-EN_STOCHRSI = _env_b("EN_STOCHRSI", True)
-EN_ADX      = _env_b("EN_ADX",      True)
-EN_ATR      = _env_b("EN_ATR",      False)
-EN_CCI      = _env_b("EN_CCI",      True)
-
-WEIGHT_TECH = _env_f("WEIGHT_TECH", 1.0)
-WEIGHT_SENT = _env_f("WEIGHT_SENT", _env_f("SENT_WEIGHT", 1.0))
-
-def _score_from_indicators(ind: dict) -> float:
-    close   = _as_float(ind.get("close"))
-    rsi     = _as_float(ind.get("rsi"))
-    macd_h  = _as_float(ind.get("hist"), _as_float(ind.get("macd")))
-    ema20   = _as_float(ind.get("ema20"))
-    ema50   = _as_float(ind.get("ema50"))
-    bb_mid  = _as_float(ind.get("bb_mid"))
-    bb_hi   = _as_float(ind.get("bb_hi"))
-    stochK  = _as_float(ind.get("stochK"))
-    stochD  = _as_float(ind.get("stochD"))
-    adx     = _as_float(ind.get("adx"))
-    pdi     = _as_float(ind.get("pdi"))
-    mdi     = _as_float(ind.get("mdi"))
-    atr_rel = _as_float(ind.get("atr_rel"))
-    cci     = _as_float(ind.get("cci"))
-
-    # normalizações 0..1
-    rsi_n   = _clip01((rsi - 30.0) / 40.0)
-    macd_n  = _clip01(0.5 + 0.5 * (math.tanh(macd_h / (abs(macd_h) + 1e-9))))
-    ema_sp  = (ema20 - ema50) / (abs(ema50) + 1e-9)
-    ema_n   = _clip01(0.5 + 0.5 * math.tanh(ema_sp * 5.0))
-    bb_rng  = (bb_hi - bb_mid)
-    bb_pos  = (close - bb_mid) / (abs(bb_rng) + 1e-9)
-    bb_n    = _clip01(0.5 + 0.5 * math.tanh((bb_pos - 0.2) * 2.0))
-    stoch_n = _clip01(stochK)
-    dmi_dir = (pdi - mdi) / (abs(pdi) + abs(mdi) + 1e-9)
-    adx_s   = _clip01(adx / 50.0)
-    adx_n   = _clip01(0.5 + 0.5 * dmi_dir * adx_s)
-    atr_n   = _clip01(1.0 - atr_rel)
-    cci_n   = _clip01(0.5 + 0.5 * math.tanh(cci / 100.0))
-
-    parts = [W_RSI*rsi_n, W_MACD*macd_n, W_EMA*ema_n, W_BB*bb_n]
-    if EN_STOCHRSI: parts.append(W_STOCHRSI*stoch_n)
-    if EN_ADX:      parts.append(W_ADX*adx_n)
-    if EN_ATR:      parts.append(W_ATR*atr_n)
-    if EN_CCI:      parts.append(W_CCI*cci_n)
-
-    w_sum = (
-        W_RSI + W_MACD + W_EMA + W_BB +
-        (W_STOCHRSI if EN_STOCHRSI else 0.0) +
-        (W_ADX if EN_ADX else 0.0) +
-        (W_ATR if EN_ATR else 0.0) +
-        (W_CCI if EN_CCI else 0.0)
-    )
-    if w_sum <= 0: return 0.0
-    return _clip01(sum(parts) / w_sum)
-
-def score_signal(ohlc_slice):
+def score_signal(ohlc: List[Dict]) -> float:
+    """
+    Retorna um score técnico [0..1].
+    NUNCA lança exceção (em erro => 0.0).
+    Aceita valores percentuais (>1) e dicionários/tuplas.
+    """
     try:
-        ind = None
-        if isinstance(ohlc_slice, list) and ohlc_slice and isinstance(ohlc_slice[-1], dict):
-            ind = ohlc_slice[-1].get("ind") or ohlc_slice[-1].get("indicators")
-        if ind is None:
-            last = ohlc_slice[-1] if ohlc_slice else {}
-            ind = {"close": _as_float(last.get("c") or last.get("close"), 0.0)}
-
-        tech = _score_from_indicators(ind)
-
-        sent_news = _as_float(ind.get("sent_news"), 0.5)
-        sent_tw   = _as_float(ind.get("sent_twitter"), 0.5)
-        sent_list = [v for v in (sent_news, sent_tw) if v >= 0.0]
-        sent = sum(sent_list)/len(sent_list) if sent_list else 0.5
-
-        mix = (tech*WEIGHT_TECH + sent*WEIGHT_SENT) / (WEIGHT_TECH + WEIGHT_SENT)
-        return {"tech": _clip01(tech), "sent": _clip01(sent), "mix": _clip01(mix)}
+        s = _score_from_indicators(ohlc)
+        if isinstance(s, dict):
+            s = s.get("score", s.get("value", 0.0))
+        elif isinstance(s, tuple):
+            s = s[0]
+        s = float(s if s is not None else 0.0)
+        if s > 1.0:  # caso seja em %
+            s /= 100.0
+        return max(0.0, min(1.0, s))
     except Exception:
-        mix = (0.0*WEIGHT_TECH + 0.5*WEIGHT_SENT) / (WEIGHT_TECH + WEIGHT_SENT)
-        return {"tech": 0.0, "sent": 0.5, "mix": _clip01(mix)}
+        return 0.0
+
+def generate_signal(ohlc: List[Dict], risk=0.01, reward_mult=2.0) -> Dict:
+    """
+    Gera um sinal simples com entry/TP/SL a partir do último close.
+    """
+    if not ohlc:
+        return {}
+    try:
+        c = float(ohlc[-1]["c"])
+        sl = c * (1.0 - risk)
+        tp = c * (1.0 + risk * reward_mult)
+        return {"entry": c, "sl": sl, "tp": tp}
+    except Exception:
+        return {}
