@@ -1,143 +1,163 @@
 # -*- coding: utf-8 -*-
 """
 sentiment_analyzer.py
-Unifica sentimento de News + Twitter e SEMPRE devolve um dict:
-{
-  "score": float 0..1,
-  "parts": {"news": float, "twitter": float},
-  "counts": {"news": int, "twitter": int}
-}
-Compatível com projetos onde as funções de fetch possam não existir.
+- Agrega sentimento de News + Twitter
+- Compatível com: get_sentiment_for_symbol(symbol, use_news=True, use_twitter=True, last_price=None)
+- Retorna sempre: {"score": 0..1, "news_n": int, "tw_n": int}
+
+Observações:
+- Se módulos específicos de news/twitter não estiverem presentes, devolve neutro (0.5) e contagem 0.
+- Pesos lidos das envs (aceita vazio sem quebrar):
+    WEIGHT_NEWS     (default 1.0)
+    WEIGHT_TWITTER  (default 1.0)
 """
 
-from __future__ import annotations
 import os
 from typing import Tuple, Dict, Any
 
-# ------------------------------------------------------------
-# Helpers de leitura de env
-# ------------------------------------------------------------
-def _bool(name: str, default: bool) -> bool:
-    v = os.getenv(name, "").strip().lower()
-    if v == "":
-        return default
-    return v in ("1", "true", "yes", "y", "on")
-
-def _f(name: str, default: float) -> float:
-    v = os.getenv(name, "").strip()
-    if v == "":
-        return default
+# --------- util ---------
+def _fenv(name: str, default: float) -> float:
+    v = os.getenv(name, "")
     try:
-        return float(v)
+        return float(v) if str(v).strip() != "" else float(default)
     except Exception:
-        return default
+        return float(default)
 
-# Pesos (podem vir do .env / variables do Railway)
-WEIGHT_NEWS = _f("WEIGHT_NEWS", _f("NEWS_WEIGHT", 1.0))
-WEIGHT_TW   = _f("WEIGHT_TW",   _f("TWITTER_WEIGHT", 1.0))
-# Se não setar nada, a mistura vai virar a média simples
-if WEIGHT_NEWS == 0 and WEIGHT_TW == 0:
-    WEIGHT_NEWS = 1.0
-    WEIGHT_TW   = 1.0
+def _clip01(x: float) -> float:
+    if x < 0.0: return 0.0
+    if x > 1.0: return 1.0
+    return x
 
-USE_NEWS = _bool("NEWS_USE", True) or _bool("ENABLE_NEWS", True)
-USE_TW   = _bool("TWITTER_USE", False)
-
-# ------------------------------------------------------------
-# Importa fontes se existirem
-# news_fetcher: precisa expor get_sentiment(symbol) -> (score 0..1, total_n)
-# twitter_fetcher: idem
-# ------------------------------------------------------------
-_news_ok = False
-_tw_ok   = False
-try:
-    # seu módulo existente
-    from news_fetcher import get_sentiment as _news_get
-    _news_ok = True
-except Exception:
-    _news_ok = False
-
-try:
-    # se você tem outro nome, ajuste aqui
-    from twitter_fetcher import get_sentiment as _tw_get
-    _tw_ok = True
-except Exception:
-    _tw_ok = False
-
-# ------------------------------------------------------------
-# Funções internas seguras
-# ------------------------------------------------------------
-def _safe_news(symbol: str) -> Tuple[float, int]:
-    """Retorna (score 0..1, n). Se indisponível, neutro 0.5 / n=0."""
-    if not USE_NEWS or not _news_ok:
-        return (0.5, 0)
-    try:
-        res = _news_get(symbol)
-        # Aceita formatos variados
-        if isinstance(res, tuple) and len(res) >= 1:
-            score = float(res[0])
-            n = int(res[1]) if len(res) > 1 else 0
-        elif isinstance(res, dict):
-            score = float(res.get("score", 0.5))
-            n = int(res.get("n", 0))
-        else:
-            score = float(res)
-            n = 0
-        # normaliza
-        if score > 1.0:
-            score /= 100.0
-        score = max(0.0, min(1.0, score))
-        return (score, n)
-    except Exception:
-        return (0.5, 0)
-
-def _safe_twitter(symbol: str) -> Tuple[float, int]:
-    """Retorna (score 0..1, n). Se indisponível, neutro 0.5 / n=0."""
-    if not USE_TW or not _tw_ok:
-        return (0.5, 0)
-    try:
-        res = _tw_get(symbol)
-        if isinstance(res, tuple) and len(res) >= 1:
-            score = float(res[0])
-            n = int(res[1]) if len(res) > 1 else 0
-        elif isinstance(res, dict):
-            score = float(res.get("score", 0.5))
-            n = int(res.get("n", 0))
-        else:
-            score = float(res)
-            n = 0
-        if score > 1.0:
-            score /= 100.0
-        score = max(0.0, min(1.0, score))
-        return (score, n)
-    except Exception:
-        return (0.5, 0)
-
-# ------------------------------------------------------------
-# API pública
-# ------------------------------------------------------------
-def get_sentiment_for_symbol(symbol: str) -> Dict[str, Any]:
+# --------- News adapter (tenta várias assinaturas conhecidas) ---------
+def _news_sent(symbol: str) -> Tuple[float, int]:
     """
-    Mistura News + Twitter com os pesos configurados.
-    SEMPRE retorna dict para o main não quebrar.
+    Retorna (score_news, n_news) com score em 0..1
+    Caso não exista módulo/func ou erro -> (0.5, 0)
     """
-    news_score, news_n = _safe_news(symbol)
-    tw_score,   tw_n   = _safe_twitter(symbol)
+    try:
+        try:
+            import news_fetcher as nf
+        except Exception:
+            nf = None
 
-    # mistura ponderada
-    w_sum = WEIGHT_NEWS + WEIGHT_TW
-    if w_sum <= 0:
-        mix = 0.5
-    else:
-        mix = (news_score * WEIGHT_NEWS + tw_score * WEIGHT_TW) / w_sum
+        if nf is None:
+            return (0.5, 0)
 
-    # bound
-    mix = max(0.0, min(1.0, mix))
+        # Tenta funções por ordem
+        candidates = [
+            "get_sentiment_for_symbol",
+            "get_news_sentiment",
+            "fetch_news_sentiment",
+            "news_sentiment_for",
+        ]
+        for fn in candidates:
+            if hasattr(nf, fn):
+                res = getattr(nf, fn)(symbol)
+                # Normaliza o retorno
+                if isinstance(res, dict):
+                    s = res.get("score", res.get("value", 0.5))
+                    n = res.get("count", res.get("n", res.get("news_n", 0)))
+                    try: s = float(s)
+                    except Exception: s = 0.5
+                    if s > 1.0: s /= 100.0
+                    return (_clip01(s), int(n) if n is not None else 0)
+                elif isinstance(res, (tuple, list)):
+                    s = 0.5
+                    n = 0
+                    if len(res) >= 1:
+                        try: s = float(res[0])
+                        except Exception: s = 0.5
+                    if len(res) >= 2:
+                        try: n = int(res[1])
+                        except Exception: n = 0
+                    if s > 1.0: s /= 100.0
+                    return (_clip01(s), n)
+                else:
+                    try:
+                        s = float(res)
+                        if s > 1.0: s /= 100.0
+                        return (_clip01(s), 0)
+                    except Exception:
+                        return (0.5, 0)
+        # Nenhuma função conhecida
+        return (0.5, 0)
+    except Exception:
+        return (0.5, 0)
+
+# --------- Twitter adapter (tenta várias assinaturas conhecidas) ---------
+def _twitter_sent(symbol: str) -> Tuple[float, int]:
+    """
+    Retorna (score_tw, n_tweets) com score em 0..1
+    Caso não exista módulo/func ou erro -> (0.5, 0)
+    """
+    try:
+        try:
+            import twitter_fetcher as tf
+        except Exception:
+            tf = None
+
+        if tf is None:
+            return (0.5, 0)
+
+        candidates = [
+            "get_sentiment_for_symbol",
+            "get_twitter_sentiment",
+            "fetch_twitter_sentiment",
+            "twitter_sentiment_for",
+        ]
+        for fn in candidates:
+            if hasattr(tf, fn):
+                res = getattr(tf, fn)(symbol)
+                if isinstance(res, dict):
+                    s = res.get("score", res.get("value", 0.5))
+                    n = res.get("count", res.get("n", res.get("tw_n", 0)))
+                    try: s = float(s)
+                    except Exception: s = 0.5
+                    if s > 1.0: s /= 100.0
+                    return (_clip01(s), int(n) if n is not None else 0)
+                elif isinstance(res, (tuple, list)):
+                    s = 0.5
+                    n = 0
+                    if len(res) >= 1:
+                        try: s = float(res[0])
+                        except Exception: s = 0.5
+                    if len(res) >= 2:
+                        try: n = int(res[1])
+                        except Exception: n = 0
+                    if s > 1.0: s /= 100.0
+                    return (_clip01(s), n)
+                else:
+                    try:
+                        s = float(res)
+                        if s > 1.0: s /= 100.0
+                        return (_clip01(s), 0)
+                    except Exception:
+                        return (0.5, 0)
+        return (0.5, 0)
+    except Exception:
+        return (0.5, 0)
+
+# --------- API principal (usada pelo main) ---------
+def get_sentiment_for_symbol(symbol: str,
+                             use_news: bool = True,
+                             use_twitter: bool = True,
+                             last_price: float = None,   # <- aceita, mas é opcional/ignorado
+                             ) -> Dict[str, Any]:
+    """
+    Retorna SEMPRE um dict: {"score": 0..1, "news_n": int, "tw_n": int}
+    """
+    # Pesos (envs tolerantes a empty string)
+    w_news = _fenv("WEIGHT_NEWS", 1.0)
+    w_tw   = _fenv("WEIGHT_TWITTER", 1.0)
+
+    s_news, n_news = _news_sent(symbol) if use_news else (0.5, 0)
+    s_tw,   n_tw   = _twitter_sent(symbol) if use_twitter else (0.5, 0)
+
+    denom = (w_news + w_tw) if (w_news + w_tw) > 0 else 1.0
+    mix = (s_news * w_news + s_tw * w_tw) / denom
 
     return {
-        "score": mix,
-        "parts": {"news": news_score, "twitter": tw_score},
-        "counts": {"news": news_n, "twitter": tw_n},
-        "enabled": {"news": USE_NEWS and _news_ok, "twitter": USE_TW and _tw_ok},
-        "weights": {"news": WEIGHT_NEWS, "twitter": WEIGHT_TW},
+        "score": _clip01(mix),
+        "news_n": int(n_news),
+        "tw_n": int(n_tw),
     }
