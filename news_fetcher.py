@@ -1,72 +1,91 @@
 # -*- coding: utf-8 -*-
-"""
-news_fetcher.py - Busca manchetes de cripto (NewsData.io) com cache simples.
-Compatível com variáveis: NEWS_API_KEY ou THENEWS_API_KEY.
-"""
-
-import os, time, json
-from typing import List, Dict, Any
+import os, time, json, math
+from datetime import datetime, timedelta
 import requests
 
-# cache em memória (sobrevive ao processo, não ao restart)
-_CACHE: Dict[str, Any] = {}
-_TTL = int(os.getenv("NEWS_CACHE_TTL", "900"))  # 900s = 15 min
+NEWS_API_URL = os.getenv("NEWS_API_URL", "https://newsdata.io/api/1/news")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
+LOOKBACK_H  = int(os.getenv("NEWS_LOOKBACK_HOURS", "12") or "12")
+MAX_PER_SRC = int(os.getenv("NEWS_MAX_PER_SOURCE", "5") or "5")
+NEWS_LANGS  = os.getenv("NEWS_LANGS", "en,pt") or "en,pt"
+NEWS_CAT    = os.getenv("NEWS_CATEGORY", "business,technology,crypto,markets") or "business,technology,crypto,markets"
+TIMEOUT_S   = int(float(os.getenv("NEWS_TIMEOUT", "8.0") or "8"))
+CACHE_FILE  = os.getenv("NEWS_CACHE_FILE", "news_cache.json") or "news_cache.json"
+CACHE_TTL   = int(os.getenv("NEWS_CACHE_TTL_MIN", "30") or "30") * 60
 
-def _get_key() -> str:
-    return (os.getenv("NEWS_API_KEY") 
-            or os.getenv("THENEWS_API_KEY") 
-            or "").strip()
+def _now_utc(): return datetime.utcnow()
 
-def _now() -> float:
-    return time.time()
+def _load_cache():
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"ts": 0, "items": {}}
 
-def _cache_key(q: str, hours: int, max_items: int) -> str:
-    return f"{q}|{hours}|{max_items}"
+def _save_cache(obj):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+    except Exception:
+        pass
 
-def _fetch_from_api(query: str, hours: int, max_items: int) -> List[Dict[str, Any]]:
-    api_key = _get_key()
-    if not api_key:
-        print("⚠️ NEWS_API_KEY não definido. Devolvendo lista vazia.")
-        return []
-
-    # janela de tempo aprox (NewsData usa params de data também; aqui uso q e tamanho)
-    url = "https://newsdata.io/api/1/news"
+def _fetch(symbol: str) -> list:
+    # Palavras-chave simples: símbolo e nome popular (se tiver mapeamento)
+    q = symbol.replace("USDT", "")
     params = {
-        "apikey": api_key,
-        "q": query,
-        "language": "en,pt",
-        "category": "business,technology",
-        "page": 1,
-        "size": max(10, max_items),
+        "apikey": NEWS_API_KEY,
+        "q": q,
+        "language": NEWS_LANGS,
+        "category": NEWS_CAT,
     }
     try:
-        r = requests.get(url, params=params, timeout=float(os.getenv("NEWS_TIMEOUT", "8")))
-        if r.status_code != 200:
-            print(f"⚠️ NewsData HTTP {r.status_code}: {r.text[:180]}")
-            return []
+        r = requests.get(NEWS_API_URL, params=params, timeout=TIMEOUT_S)
+        r.raise_for_status()
         data = r.json()
+        # Normaliza lista de resultados:
         articles = data.get("results") or data.get("articles") or []
-        rows = []
-        for a in articles[:max_items]:
-            rows.append({
-                "title": a.get("title"),
-                "desc": a.get("description"),
-                "link": a.get("link") or a.get("url"),
-                "pubDate": a.get("pubDate") or a.get("pubDate_tz") or a.get("pubDateUTC"),
-                "source": (a.get("source_id") or a.get("source") or ""),
-            })
-        return rows
-    except Exception as e:
-        print(f"⚠️ Erro NewsData: {e}")
+        return articles[: MAX_PER_SRC] if MAX_PER_SRC > 0 else articles
+    except Exception:
         return []
 
-def get_news(query: str, lookback_hours: int = 6, max_items: int = 20) -> List[Dict[str, Any]]:
-    """Retorna manchetes (com cache por 15min)."""
-    ck = _cache_key(query, lookback_hours, max_items)
-    hit = _CACHE.get(ck)
-    if hit and (_now() - hit["t"]) < _TTL:
-        return hit["data"]
+def _cached(symbol: str) -> list:
+    cache = _load_cache()
+    if time.time() - cache.get("ts", 0) <= CACHE_TTL:
+        lst = cache.get("items", {}).get(symbol)
+        if isinstance(lst, list):
+            return lst
+    items = _fetch(symbol)
+    cache.setdefault("items", {})[symbol] = items
+    cache["ts"] = time.time()
+    _save_cache(cache)
+    return items
 
-    rows = _fetch_from_api(query, lookback_hours, max_items)
-    _CACHE[ck] = {"t": _now(), "data": rows}
-    return rows
+def _simple_sentiment(text: str) -> float:
+    """Heurística simples 0..1. (substitua por modelo se quiser)"""
+    if not text: return 0.5
+    t = text.lower()
+    pos = sum(w in t for w in ["surge", "rally", "bull", "up", "record", "buy", "partnership", "growth"])
+    neg = sum(w in t for w in ["fall", "dump", "bear", "down", "hack", "lawsuit", "ban", "sell"])
+    score = 0.5 + 0.1*(pos - neg)
+    return min(1.0, max(0.0, score))
+
+def get_sentiment_for_symbol(symbol: str):
+    """
+    Retorna {"score":0..1, "count":N}
+    """
+    if not NEWS_API_KEY:
+        return {"score": 0.5, "count": 0}
+    items = _cached(symbol)
+    if not items:
+        return {"score": 0.5, "count": 0}
+    scores = []
+    for it in items:
+        title = it.get("title") or ""
+        desc  = it.get("description") or ""
+        s = _simple_sentiment(f"{title}. {desc}")
+        scores.append(s)
+        if len(scores) >= MAX_PER_SRC > 0:
+            break
+    if not scores:
+        return {"score": 0.5, "count": 0}
+    return {"score": sum(scores)/len(scores), "count": len(scores)}
