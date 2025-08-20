@@ -7,10 +7,10 @@ ENV principais:
   NEWS_LOOKBACK_MIN=180
   NEWS_MAX_ITEMS=40
   NEWS_LANGS=pt,en
-  CRYPTOPANIC_TOKEN=xxxxx            # opcional (fallback de notícias)
+  CRYPTOPANIC_TOKEN=6af8578b33d24fed33f1e3c4be99df7d5bfc9c60            # opcional (fallback de notícias)
 
   TWITTER_USE=true|false
-  TWITTER_BEARER_TOKEN=AAAAAAAA...   # necessário para Twitter
+  TWITTER_BEARER_TOKEN=AAAAAAAAAAAAAAAAAAAAAJyg3gEAAAAAIttc5n2QQTH2nZPp%2FQy0tT6kRAI%3Db8J9ALE3cVLQC4h3gusWWq7XLEXJ7OVJgk2ep7SkGjf7Wr8aWk   # necessário para Twitter
   TWITTER_LOOKBACK_MIN=120
   TWITTER_MAX_TWEETS=60
   TWITTER_LANGS=pt,en
