@@ -1,223 +1,144 @@
-# -*- coding: utf-8 -*-
-"""
-sentiment_analyzer.py — coleta sentimento de News + Twitter com fallbacks e logs claros.
+# sentiment_analyzer.py
+# Sentimento combinado: CryptoPanic (news) + Twitter (v2 search recent).
+# Saída SEMPRE: {"score": float(0..100), "news_n": int, "tw_n": int}
 
-ENV principais:
-  NEWS_USE=true|false
-  NEWS_LOOKBACK_MIN=180
-  NEWS_MAX_ITEMS=40
-  NEWS_LANGS=pt,en
-  CRYPTOPANIC_TOKEN=6af8578b33d24fed33f1e3c4be99df7d5bfc9c60            # opcional (fallback de notícias)
+import os, time, json, math, urllib.parse, urllib.request, ssl
+from typing import Dict
 
-  TWITTER_USE=true|false
-  TWITTER_BEARER_TOKEN=AAAAAAAAAAAAAAAAAAAAAJyg3gEAAAAAIttc5n2QQTH2nZPp%2FQy0tT6kRAI%3Db8J9ALE3cVLQC4h3gusWWq7XLEXJ7OVJgk2ep7SkGjf7Wr8aWk   # necessário para Twitter
-  TWITTER_LOOKBACK_MIN=120
-  TWITTER_MAX_TWEETS=60
-  TWITTER_LANGS=pt,en
+# ---- Config via ENV ----
+NEWS_USE = os.getenv("NEWS_USE", "true").lower() == "true"
+CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "").strip()
+NEWS_LOOKBACK_MIN = int(os.getenv("NEWS_LOOKBACK_MIN", "180"))
+NEWS_MAX_ITEMS = int(os.getenv("NEWS_MAX_ITEMS", "30"))
+WEIGHT_NEWS = float(os.getenv("WEIGHT_NEWS", "1.0"))
 
-Pesos (no mix dentro do main):
-  WEIGHT_TECH, WEIGHT_SENT (definidos no main)
+TWITTER_USE = os.getenv("TWITTER_USE", "true").lower() == "true"
+TWITTER_BEARER = os.getenv("TWITTER_BEARER_TOKEN", "").strip()
+TWITTER_LOOKBACK_MIN = int(os.getenv("TWITTER_LOOKBACK_MIN", "120"))
+TWITTER_MAX_TWEETS = int(os.getenv("TWITTER_MAX_TWEETS", "80"))
+TWITTER_LANGS = os.getenv("TWITTER_LANGS", "en,pt").split(",")
+WEIGHT_TW = float(os.getenv("WEIGHT_TW", "1.0"))
 
-Retorno: {"score": 0..1, "news_n": int, "tw_n": int}
-"""
-from __future__ import annotations
-import os, json, math, time, re
-from datetime import datetime, timedelta
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
+COMBINE_T_OVER_S = float(os.getenv("MIX_TECH_OVER_SENT", "1.5"))  # usado só pelo main, deixo aqui por padrão
 
-# -------------------- utils/ENV --------------------
-def _get(name: str, default: str = "") -> str:
-    v = os.getenv(name, default)
-    return v if v is not None else default
+# SSL
+_CTX = ssl.create_default_context()
 
-def _to_bool(v: str) -> bool:
-    return str(v).strip().lower() in ("1","true","yes","on")
+def _now_ts() -> int:
+    return int(time.time())
 
-def _now_utc() -> datetime:
-    return datetime.utcnow()
+def _since_minutes_to_iso(minutes: int) -> str:
+    # Twitter/CryptoPanic aceitam ISO8601
+    t = _now_ts() - minutes * 60
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
-def _ts() -> str:
-    return _now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def _split_csv(s: str) -> list[str]:
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-# -------------------- dicionários simples p/ polaridade --------------------
-POS = {"surge","pump","bull","breakout","partnership","upgrade","launch","funding",
-       "approval","win","record","all-time high","ath","rise","rally","acquisition",
-       "integration","support","positive","otimista","alta","subindo","parceria","suporte"}
-NEG = {"dump","bear","hack","exploit","lawsuit","ban","delist","halt","probe","scam",
-       "down","fall","drop","crash","delay","bug","vulnerab","negative","queda","bloqueio",
-       "investigation","fraud","penalty","fine","stop","suspens","interrup"}
-
-_word = re.compile(r"[a-zA-Zçáéíóúàãõâêô]+", re.IGNORECASE)
-
-def _score_text(text: str) -> float:
-    if not text:
-        return 0.0
-    t = text.lower()
-    pos = sum(1 for m in _word.findall(t) if any(p in m for p in POS))
-    neg = sum(1 for m in _word.findall(t) if any(n in m for n in NEG))
-    if pos == 0 and neg == 0:
-        return 0.0
-    # mapear para [-1,1]
-    raw = (pos - neg) / (pos + neg)
-    return max(-1.0, min(1.0, raw))
-
-def _aggregate_scores(items: list[dict], key_fields=("title","text","description")) -> float:
-    if not items:
-        return 0.0
-    vals = []
-    for it in items:
-        chunk = " ".join(str(it.get(k,"")) for k in key_fields)
-        vals.append(_score_text(chunk))
-    # média com atenuação por outliers
-    if not vals:
-        return 0.0
-    vals.sort()
-    n = len(vals)
-    cut = max(0, n//10)  # descarta 10% extremos de cada lado
-    trimmed = vals[cut:n-cut] if n >= 10 else vals
-    return sum(trimmed) / len(trimmed)
-
-# -------------------- News: usa módulo local se existir; fallback CryptoPanic --------------------
-def _news_collect(symbol: str, lookback_min: int, max_items: int, langs: list[str]) -> list[dict]:
-    if not _to_bool(_get("NEWS_USE","true")):
-        print(f"[NEWS] desativado por ENV (NEWS_USE=false).")
-        return []
-
-    # 1) tenta módulo local (news_fetcher)
+# ---------- CryptoPanic ----------
+def _fetch_news_score(symbol: str, last_price: float | None) -> tuple[float, int]:
+    if not NEWS_USE or not CRYPTOPANIC_API_KEY:
+        return 50.0, 0
+    # Consulta básica por termo: símbolo puro e nome do par
+    # Ex.: BTC, BTCUSDT
+    q = f"{symbol} OR {symbol}USDT"
+    params = {
+        "auth_token": CRYPTOPANIC_API_KEY,
+        "filter": "hot",
+        "currencies": symbol[:-4] if symbol.endswith("USDT") else symbol,
+        "public": "true"
+    }
+    url = "https://cryptopanic.com/api/developer/v1/posts/?" + urllib.parse.urlencode(params)
     try:
-        import importlib
-        nf = importlib.import_module("news_fetcher")  # type: ignore
-        if hasattr(nf, "get_news_for_symbol"):
-            items = nf.get_news_for_symbol(symbol, lookback_min=lookback_min,
-                                           max_items=max_items, langs=langs)  # type: ignore
-            if isinstance(items, list):
-                return items[:max_items]
-    except Exception as e:
-        print(f"[NEWS] módulo news_fetcher indisponível/erro: {e}. Vou tentar CryptoPanic.")
+        with urllib.request.urlopen(url, context=_CTX, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return 50.0, 0
 
-    # 2) fallback: CryptoPanic (se token existir)
-    token = _get("CRYPTOPANIC_TOKEN","").strip()
-    if not token:
-        print("[NEWS] Sem CRYPTOPANIC_TOKEN; retornando vazio (n=0).")
-        return []
-    # monta consulta
-    until = _now_utc()
-    since = until - timedelta(minutes=lookback_min)
-    q = f"{symbol.replace('USDT','')}"
-    url = (f"https://cryptopanic.com/api/v1/posts/?auth_token={token}"
-           f"&currencies={q}&filter=rising&public=true")
-    try:
-        req = Request(url, headers={"User-Agent":"Mozilla/5.0"})
-        with urlopen(req, timeout=20) as r:
-            raw = r.read().decode("utf-8","ignore")
-            data = json.loads(raw)
-            out = []
-            for p in data.get("results", [])[:max_items]:
-                out.append({
-                    "title": p.get("title",""),
-                    "text": p.get("domain",""),
-                    "published_at": p.get("published_at",""),
-                    "url": p.get("url",""),
-                })
-            return out
-    except HTTPError as e:
-        print(f"[NEWS] HTTP {e.code} CryptoPanic; retornando n=0.")
-    except URLError as e:
-        print(f"[NEWS] ERRO rede CryptoPanic: {e}; n=0.")
-    except Exception as e:
-        print(f"[NEWS] ERRO CryptoPanic: {e}; n=0.")
-    return []
+    posts = data.get("results", [])[:NEWS_MAX_ITEMS]
+    if not posts:
+        return 50.0, 0
 
-# -------------------- Twitter: API v2 recent search --------------------
-def _twitter_collect(symbol: str, lookback_min: int, max_tweets: int, langs: list[str]) -> list[dict]:
-    if not _to_bool(_get("TWITTER_USE","true")):
-        print(f"[TW] desativado por ENV (TWITTER_USE=false).")
-        return []
-    bearer = _get("TWITTER_BEARER_TOKEN","").strip()
-    if not bearer:
-        print("[TW] Sem TWITTER_BEARER_TOKEN; n=0.")
-        return []
-    query_sym = symbol.replace("USDT","")
-    query = f"({query_sym} OR #{query_sym}) lang:{' OR lang:'.join(langs)} -is:retweet"
-    end = _now_utc()
-    start = end - timedelta(minutes=lookback_min)
-    url = ("https://api.twitter.com/2/tweets/search/recent"
-           f"?query={re.sub(r'\\s+','%20',query)}"
-           f"&max_results={min(100, max_tweets)}"
-           f"&tweet.fields=created_at,lang,public_metrics,source,context_annotations,entities")
-    try:
-        req = Request(url, headers={"Authorization": f"Bearer {bearer}",
-                                    "User-Agent":"Mozilla/5.0"})
-        with urlopen(req, timeout=20) as r:
-            raw = r.read().decode("utf-8","ignore")
-            data = json.loads(raw)
-            out = []
-            for t in data.get("data", []):
-                out.append({
-                    "title": "",
-                    "text": t.get("text",""),
-                    "created_at": t.get("created_at",""),
-                    "lang": t.get("lang",""),
-                })
-            return out[:max_tweets]
-    except HTTPError as e:
-        print(f"[TW] HTTP {e.code} Twitter; n=0.")
-    except URLError as e:
-        print(f"[TW] ERRO rede Twitter: {e}; n=0.")
-    except Exception as e:
-        print(f"[TW] ERRO Twitter: {e}; n=0.")
-    return []
+    # Heurística simples: sentiment field (bullish/bearish/neutral) se existir
+    pos = neg = 0
+    for p in posts:
+        s = (p.get("sentiment") or "").lower()
+        if "bull" in s or s == "positive":
+            pos += 1
+        elif "bear" in s or s == "negative":
+            neg += 1
+    total = pos + neg
+    if total == 0:
+        return 50.0, len(posts)
 
-# -------------------- API pública --------------------
-def get_sentiment_for_symbol(symbol: str) -> dict:
-    """
-    Retorna dict com:
-      score  -> [0..1]
-      news_n -> int
-      tw_n   -> int
-    """
-    # parâmetros
-    news_lb   = int(_get("NEWS_LOOKBACK_MIN","180"))
-    news_max  = int(_get("NEWS_MAX_ITEMS","40"))
-    news_lang = _split_csv(_get("NEWS_LANGS","pt,en"))
+    raw = 50.0 + 50.0 * (pos - neg) / max(1, total)
+    return max(0.0, min(100.0, raw)), len(posts)
 
-    tw_lb     = int(_get("TWITTER_LOOKBACK_MIN","120"))
-    tw_max    = int(_get("TWITTER_MAX_TWEETS","60"))
-    tw_lang   = _split_csv(_get("TWITTER_LANGS","pt,en"))
+# ---------- Twitter v2 recent search ----------
+def _fetch_twitter_score(symbol: str, last_price: float | None) -> tuple[float, int]:
+    if not TWITTER_USE or not TWITTER_BEARER:
+        return 50.0, 0
 
-    # coletar
-    news_items = _news_collect(symbol, news_lb, news_max, news_lang)
-    tw_items   = _twitter_collect(symbol, tw_lb, tw_max, tw_lang)
-
-    news_n = len(news_items)
-    tw_n   = len(tw_items)
-
-    # scorers
-    news_s = _aggregate_scores(news_items, key_fields=("title","text"))
-    tw_s   = _aggregate_scores(tw_items,   key_fields=("text",))
-
-    # mapeia de [-1,1] → [0,1]
-    def _to01(x: float) -> float: return 0.5 + 0.5*max(-1.0, min(1.0, x))
-
-    news_01 = _to01(news_s)
-    tw_01   = _to01(tw_s)
-
-    # pesos internos (ajuste leve)
-    w_news = 0.6 if news_n > 0 else 0.0
-    w_tw   = 0.4 if tw_n   > 0 else 0.0
-    if w_news + w_tw == 0:
-        score = 0.5
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
     else:
-        score = (news_01*w_news + tw_01*w_tw) / (w_news + w_tw)
+        base = symbol
 
-    print(f"[SENT] {symbol}: news n={news_n}, tw n={tw_n}, score={round(score*100,1)}%")
-    return {"score": float(score), "news_n": int(news_n), "tw_n": int(tw_n)}
+    # Query simples evitando spam de 100% casadas:
+    query = f"({base} OR {base}USDT OR #{base}) lang:en OR lang:pt -is:retweet"
+    params = {
+        "query": query,
+        "max_results": min(100, max(10, TWITTER_MAX_TWEETS)),
+        "start_time": _since_minutes_to_iso(TWITTER_LOOKBACK_MIN),
+        "tweet.fields": "lang,public_metrics,created_at"
+    }
+    url = "https://api.twitter.com/2/tweets/search/recent?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {TWITTER_BEARER}")
+    req.add_header("Accept", "application/json")
 
-if __name__ == "__main__":
-    # pequeno teste manual
-    sym = os.getenv("TEST_SYMBOL","BTCUSDT")
-    print(get_sentiment_for_symbol(sym))
+    try:
+        with urllib.request.urlopen(req, context=_CTX, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return 50.0, 0
+
+    tweets = data.get("data", [])
+    if not tweets:
+        return 50.0, 0
+
+    # Sinal muito leve com base em engajamento: (likes + 2*retweets) balanceado
+    score = 50.0
+    tot = 0
+    for t in tweets:
+        pm = t.get("public_metrics", {})
+        like = pm.get("like_count", 0)
+        rt = pm.get("retweet_count", 0)
+        rep = pm.get("reply_count", 0)
+        val = like + 2*rt + 0.5*rep
+        score += 0.02 * val   # escala baixa para não explodir
+        tot += 1
+
+    score = max(0.0, min(100.0, score))
+    return score, tot
+
+# ---------- API PÚBLICA ----------
+def get_sentiment_for_symbol(symbol: str, last_price: float | None = None) -> Dict:
+    news_score, news_n = _fetch_news_score(symbol, last_price)
+    tw_score, tw_n = _fetch_twitter_score(symbol, last_price)
+
+    # Combinação simples média ponderada (ambos default 1.0)
+    parts = []
+    wsum = 0.0
+    if news_n > 0 or NEWS_USE:
+        parts.append((news_score, WEIGHT_NEWS))
+        wsum += WEIGHT_NEWS
+    if tw_n > 0 or TWITTER_USE:
+        parts.append((tw_score, WEIGHT_TW))
+        wsum += WEIGHT_TW
+
+    if not parts or wsum == 0:
+        combined = 50.0
+    else:
+        combined = sum(s*w for s, w in parts) / wsum
+
+    return {"score": float(max(0.0, min(100.0, combined))),
+            "news_n": int(news_n),
+            "tw_n": int(tw_n)}
