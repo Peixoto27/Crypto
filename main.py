@@ -1,333 +1,428 @@
-# -*- coding: utf-8 -*-
-"""
-Pipeline principal – versão CryptoCompare-first
-- Universo de moedas por CryptoCompare (ou lista fixa via UNIVERSE_LIST)
-- OHLC 4h (30 dias) por CryptoCompare
-- Sentimento via sentiment_analyzer (se existir) com fallback
-- Score técnico: usa função externa do projeto se disponível; senão fallback simples
-- Logs compatíveis com seu runner.py
-"""
-
-from __future__ import annotations
+# main.py
 import os
 import json
 import time
 import math
 import traceback
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
-import requests
-
-# =========================
-# Config/Env (com defaults)
-# =========================
-INTERVAL_MIN = float(os.getenv("BINANCE_INTERVAL", os.getenv("INTERVAL_MIN", "20")))
-DAYS_OHLC = int(os.getenv("DAYS_OHLC", "30"))
-CANDLES_4H = DAYS_OHLC * 24 // 4  # 30d * 6 = 180
-UNIVERSE_LIMIT = int(os.getenv("UNIVERSE_LIMIT", "100"))
-
-# Feature flags (log)
-NEWS_USE = os.getenv("NEWS_USE", "true").lower() == "true"
-AI_ENABLE = os.getenv("AI_ENABLE", "true").lower() == "true"
-HISTORY_ENABLE = os.getenv("HISTORY_ENABLE", "true").lower() == "true"
-TWITTER_USE = os.getenv("TWITTER_USE", "true").lower() == "true"
-
-# Pesos/mix
-MIX_TECH_OVER_SENT = float(os.getenv("MIX_TECH_OVER_SENT", "1.5"))
-MIX_SENT_OVER_TECH = float(os.getenv("MIX_SENT_OVER_TECH", "1.0"))
-MIX_MIN_THRESHOLD = float(os.getenv("MIX_MIN_THRESHOLD", "70"))
-
-# CryptoCompare
-CC_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY", "").strip()
-CC_BASE = "https://min-api.cryptocompare.com"
-
-# Remoção de pares redundantes (FDUSD, TUSD etc.)
-STABLE_TICKERS = set(os.getenv(
-    "STABLE_TICKERS",
-    "USDT,USDC,FDUSD,TUSD,DAI,EUR,BRL,TRY,BUSD,UST"
-).split(","))
-
-
-# =========================
-# Util / Logs
-# =========================
+# ==============================
+# Utilidade de log (ASCII only)
+# ==============================
 def _log(msg: str) -> None:
     print(msg, flush=True)
 
+# ==============================
+# Configuração via ENV
+# ==============================
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name, str(default)).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
 
-def _err(msg: str) -> None:
-    print(f"\u274c {msg}", flush=True)
-
-
-def _warn(msg: str) -> None:
-    print(f"\u26a0\ufe0f {msg}", flush=True)
-
-
-def _ok(msg: str) -> None:
-    print(f"   \u2192 OK | {msg}", flush=True)
-
-
-# =========================
-# Universo de Moedas
-# =========================
-def _pair_from_symbol(base: str, quote: str = "USDT") -> str:
-    return f"{base.upper()}{quote.upper()}"
-
-
-def get_universe() -> List[str]:
-    """
-    1) Se UNIVERSE_LIST estiver definida -> usa.
-    2) Senão, pega top mktcap pela CryptoCompare e monta pares XXXUSDT.
-    """
-    raw = os.getenv("UNIVERSE_LIST", "").strip()
-    if raw:
-        items = [s.strip().upper() for s in raw.split(",") if s.strip()]
-        return items[:UNIVERSE_LIMIT]
-
-    if not CC_API_KEY:
-        _err("Sem CRYPTOCOMPARE_API_KEY. Defina-a ou use UNIVERSE_LIST.")
-        return []
-
-    # Top mktcap (máx 100 por chamada)
-    url = f"{CC_BASE}/data/top/mktcapfull"
-    params = {"tsym": "USD", "limit": min(UNIVERSE_LIMIT, 100), "api_key": CC_API_KEY}
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
+        return float(default)
     try:
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        result = []
-        for item in data.get("Data", []):
-            coin = item.get("CoinInfo", {})
-            sym = (coin.get("Name") or "").upper()
-            if not sym:
-                continue
-            # evita pares com a própria stable como base (ex.: USDTUSDT)
-            if sym in STABLE_TICKERS:
-                continue
-            result.append(_pair_from_symbol(sym, "USDT"))
-        # Remove pares estáveis redundantes (ex.: FDUSDUSDT)
-        before = len(result)
-        result = [p for p in result if p.replace("USDT", "") not in STABLE_TICKERS]
-        removed = before - len(result)
-        if removed > 0:
-            _log(f"\U0001f9e0 Removidos {removed} pares estáveis redundantes (ex.: FDUSDUSDT).")
-        return result
-    except Exception as e:
-        _err(f"Falha ao obter universo na CryptoCompare: {e}")
-        return []
+        return float(v)
+    except ValueError:
+        # aceita formatos como "4h", "90m"
+        s = v.strip().lower()
+        if s.endswith("h"):
+            return float(int(s[:-1]) * 60)
+        if s.endswith("m"):
+            return float(int(s[:-1]))
+        return float(default)
 
+INTERVAL_MIN = _env_float("INTERVAL_MIN", _env_float("BINANCE_INTERVAL", 20))
+AI_ENABLE     = _env_bool("AI_ENABLE", True)
+NEWS_USE      = _env_bool("NEWS_USE", True)
+TWITTER_USE   = _env_bool("TWITTER_USE", True)
 
-# =========================
-# OHLC (CryptoCompare, 4h)
-# =========================
-def fetch_ohlc_cc(pair: str, candles: int = CANDLES_4H) -> List[Dict[str, Any]]:
-    """
-    Busca candles de 4h na CryptoCompare: histohour + aggregate=4
-    Retorna lista de dicts: [{t, o, h, l, c}, ...]
-    """
-    if not CC_API_KEY:
-        raise RuntimeError("CRYPTOCOMPARE_API_KEY não configurada.")
-    base = pair.replace("USDT", "")
-    url = f"{CC_BASE}/data/v2/histohour"
+MIX_TECH_OVER_SENT = _env_float("MIX_TECH_OVER_SENT", 1.5)  # peso do técnico
+MIX_SENT_OVER_TECH = _env_float("MIX_SENT_OVER_TECH", 1.0)  # peso do sentimento
+MIX_MIN_THRESHOLD  = _env_float("MIX_MIN_THRESHOLD", 70.0)  # limiar de sinal
+
+OHLC_DAYS      = int(os.getenv("OHLC_DAYS", "30"))
+OHLC_LIMIT     = int(os.getenv("OHLC_LIMIT", "180"))  # numero de candles a buscar
+OHLC_TIMEFRAME = os.getenv("OHLC_TIMEFRAME", "1h").lower()  # 1d, 1h, 1m
+
+CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY") or os.getenv("CRYPTOCOMPARE_APIKEY") or os.getenv("CRYPTOCOMPARE_API_KEY".upper())
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHATID = os.getenv("TELEGRAM_CHAT_ID")
+
+# ==============================
+# Universo de símbolos
+# ==============================
+def load_symbol_list() -> List[str]:
+    csv = os.getenv("SYMBOLS", "").strip()
+    if csv:
+        syms = [s.strip().upper() for s in csv.split(",") if s.strip()]
+        return syms
+
+    # fallback: conjunto padrão (30)
+    return [
+        "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","ADAUSDT","DOGEUSDT","TRXUSDT",
+        "AVAXUSDT","LINKUSDT","MATICUSDT","TONUSDT","SHIBUSDT","DOTUSDT","LTCUSDT","UNIUSDT",
+        "BCHUSDT","ETCUSDT","APTUSDT","IMXUSDT","FILUSDT","NEARUSDT","OPUSDT","XLMUSDT",
+        "HBARUSDT","INJUSDT","ARBUSDT","LDOUSDT","ATOMUSDT","STXUSDT",
+    ]
+
+# ==============================
+# HTTP util (com backoff)
+# ==============================
+def http_get_json(url: str, headers: Dict[str, str], max_retries: int = 6) -> Dict:
+    backoff = 5.0
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            last_err = e
+            _log(f"Aviso HTTP {e.code} em {url} — aguardando {backoff:.1f}s (tentativa {attempt}/{max_retries})")
+            time.sleep(backoff)
+            backoff *= 2.2
+        except URLError as e:
+            last_err = e
+            _log(f"Aviso URLError em {url}: {e} — aguardando {backoff:.1f}s (tentativa {attempt}/{max_retries})")
+            time.sleep(backoff)
+            backoff *= 2.2
+        except Exception as e:
+            last_err = e
+            _log(f"Aviso geral em {url}: {e} — aguardando {backoff:.1f}s (tentativa {attempt}/{max_retries})")
+            time.sleep(backoff)
+            backoff *= 2.2
+    raise RuntimeError(f"GET falhou após {max_retries} tentativas: {last_err}")
+
+# ==============================
+# OHLC via CryptoCompare
+# ==============================
+def cc_hist_endpoint(tf: str) -> Tuple[str, str]:
+    tf = tf.lower()
+    if tf in ("1d","d","day","1day"):
+        return ("histoday", "1d")
+    if tf in ("1h","h","hour","1hour","60"):
+        return ("histohour", "1h")
+    if tf in ("1m","m","min","minute"):
+        return ("histominute", "1m")
+    # padrão seguro
+    return ("histohour", "1h")
+
+def fetch_ohlc_cc(symbol: str, limit: int = OHLC_LIMIT, tf: str = OHLC_TIMEFRAME) -> List[Dict]:
+    if not CRYPTOCOMPARE_API_KEY:
+        raise RuntimeError("CRYPTOCOMPARE_API_KEY não definido.")
+
+    base = symbol.upper().replace("USDT","")
+    quote = "USDT"
+    endpoint, _tf = cc_hist_endpoint(tf)
+
     params = {
         "fsym": base,
-        "tsym": "USDT",
-        "limit": max(1, min(candles, 2000)) - 1,  # limit é n-1
-        "aggregate": 4,
-        "api_key": CC_API_KEY,
+        "tsym": quote,
+        "limit": max(1, min(2000, int(limit))),
+        "api_key": CRYPTOCOMPARE_API_KEY,
+        "aggregate": 1,
     }
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    js = r.json()
-    if js.get("Response") != "Success":
-        raise RuntimeError(f"CC retornou erro: {js.get('Message')}")
-    data = js.get("Data", {}).get("Data", [])
+    url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}?{urlencode(params)}"
+    data = http_get_json(url, headers={"Accept":"application/json"})
+
+    if not data or data.get("Response") != "Success":
+        raise RuntimeError(f"CryptoCompare resposta inválida para {symbol}: {data}")
+
+    rows = data.get("Data",{}).get("Data",[])
     ohlc = []
-    for d in data:
+    for r in rows:
+        # alguns pontos podem vir com volume zero ou close zero; filtramos
+        if r.get("close") in (None,0) or r.get("high") in (None,0) or r.get("low") in (None,0) or r.get("open") in (None,0):
+            continue
         ohlc.append({
-            "t": int(d["time"]),
-            "o": float(d["open"]),
-            "h": float(d["high"]),
-            "l": float(d["low"]),
-            "c": float(d["close"]),
-            "v": float(d.get("volumefrom", 0.0)),
+            "t": int(r["time"]),
+            "o": float(r["open"]),
+            "h": float(r["high"]),
+            "l": float(r["low"]),
+            "c": float(r["close"]),
+            "v": float(r.get("volumeto", 0.0)),
         })
     return ohlc
 
-
-# =========================
-# Sentimento (News/Twitter)
-# =========================
-def get_sentiment(sym: str, last_price: Optional[float]) -> Dict[str, Any]:
-    """
-    Integra com sentiment_analyzer.get_sentiment_for_symbol se existir.
-    Fallback: neutro (50%).
-    """
-    try:
-        from sentiment_analyzer import get_sentiment_for_symbol  # seu arquivo enviado
-        sent = get_sentiment_for_symbol(symbol=sym, last_price=last_price)
-        # esperado: {"score": float(0..100), "news_n": int, "tw_n": int}
-        if isinstance(sent, dict) and "score" in sent:
-            return {
-                "score": float(sent.get("score", 50.0)),
-                "news_n": int(sent.get("news_n", 0)),
-                "tw_n": int(sent.get("tw_n", 0)),
-            }
-    except Exception as e:
-        _warn(f"[SENT] erro {sym}: {e}")
-    return {"score": 50.0, "news_n": 0, "tw_n": 0}
-
-
-# =========================
-# Score técnico (fallback)
-# =========================
-def _sma(values: List[float], win: int) -> float:
-    if len(values) < win:
-        return float("nan")
-    return sum(values[-win:]) / win
-
-
-def _rsi(values: List[float], win: int = 14) -> float:
-    if len(values) < win + 1:
-        return float("nan")
-    gains, losses = 0.0, 0.0
-    for i in range(-win, 0):
-        delta = values[i] - values[i - 1]
-        if delta >= 0:
-            gains += delta
+# ==============================
+# Indicadores técnicos básicos
+# ==============================
+def ema(series: List[float], period: int) -> List[float]:
+    k = 2 / (period + 1)
+    out = []
+    ema_prev = None
+    for x in series:
+        if ema_prev is None:
+            ema_prev = x
         else:
-            losses -= delta
-    if losses == 0:
-        return 100.0
-    rs = gains / max(1e-9, losses)
-    return 100.0 - (100.0 / (1.0 + rs))
+            ema_prev = x * k + ema_prev * (1 - k)
+        out.append(ema_prev)
+    return out
 
+def rsi(series: List[float], period: int = 14) -> List[float]:
+    gains = []
+    losses = []
+    rsis = []
+    prev = None
+    avg_gain = avg_loss = None
+    for x in series:
+        if prev is None:
+            gains.append(0.0); losses.append(0.0)
+            rsis.append(50.0)
+            prev = x
+            continue
+        ch = x - prev
+        g = max(ch, 0.0)
+        l = max(-ch, 0.0)
+        gains.append(g); losses.append(l)
+        prev = x
+        if len(gains) < period + 1:
+            rsis.append(50.0)
+            continue
+        if avg_gain is None:
+            avg_gain = sum(gains[-period:]) / period
+            avg_loss = sum(losses[-period:]) / period
+        else:
+            avg_gain = (avg_gain * (period - 1) + g) / period
+            avg_loss = (avg_loss * (period - 1) + l) / period
+        if avg_loss == 0:
+            rs = float("inf")
+            rsis.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsis.append(100 - (100 / (1 + rs)))
+    return rsis
 
-def technical_score(ohlc: List[Dict[str, Any]]) -> float:
-    """
-    1) Se existir função do seu projeto, usa (por ex., apply_strategies.score_from_indicators).
-    2) Fallback simples: média de 3 sinais (tendência SMA, RSI, preço vs SMA50).
-    Retorna 0..100 (%).
-    """
-    # 1) tentar função externa do projeto
-    try:
-        from apply_strategies import score_from_indicators as _score_ext  # se existir
-        try:
-            return float(_score_ext(ohlc))  # sua função pode aceitar OHLC bruto
-        except TypeError:
-            pass
-    except Exception:
-        pass
+def macd(series: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[List[float], List[float]]:
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = [f - s for f,s in zip(ema_fast, ema_slow)]
+    signal_line = ema(macd_line, signal)
+    return macd_line, signal_line
 
-    # 2) fallback simples
+def technical_score(ohlc: List[Dict]) -> Tuple[float, Dict[str,float]]:
+    """Retorna (score em % 0-100, detalhes)"""
     closes = [x["c"] for x in ohlc]
     if len(closes) < 60:
-        return 0.0
-    sma20 = _sma(closes, 20)
-    sma50 = _sma(closes, 50)
-    rsi14 = _rsi(closes, 14)
-    last = closes[-1]
+        return 0.0, {"note": 0.0}
 
-    score_tend = 100.0 if sma20 > sma50 else 0.0
-    score_rsi = max(0.0, min(100.0, (rsi14 - 30.0) * (100.0 / 40.0)))  # 30-70 -> 0..100
-    score_price = 100.0 if last > sma50 else 0.0
+    rsi14 = rsi(closes, 14)
+    r_now = rsi14[-1]
 
-    return 0.4 * score_tend + 0.3 * score_rsi + 0.3 * score_price
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    e20 = ema20[-1]; e50 = ema50[-1]
 
+    macd_line, sig_line = macd(closes)
+    m_now = macd_line[-1]; s_now = sig_line[-1]
+    hist = m_now - s_now
 
-# =========================
+    # normalizações simples para 0..100
+    # 1) RSI: 50 -> 50%, 30 -> 0%, 70 -> 100%
+    rsi_score = max(0.0, min(100.0, (r_now - 30) * (100/40)))  # 30..70
+
+    # 2) EMA: se e20>e50, bônus; distância relativa limitada
+    dist = (e20 - e50) / e50 if e50 != 0 else 0.0
+    ema_score = max(0.0, min(100.0, 50.0 + 500.0 * dist))  # +-10% vira +-50 pontos
+
+    # 3) MACD hist: normaliza por desvio das últimas 100 barras
+    last = macd_line[-100:] if len(macd_line) >= 100 else macd_line
+    mean = sum(last)/len(last) if last else 0.0
+    var = sum((x-mean)**2 for x in last)/len(last) if last else 0.0
+    sd = math.sqrt(var)
+    z = (hist - mean)/sd if sd > 1e-9 else 0.0
+    macd_score = max(0.0, min(100.0, 50.0 + 10.0 * z))  # z-score comprimido
+
+    score = 0.4*rsi_score + 0.35*ema_score + 0.25*macd_score
+    details = {
+        "rsi": round(r_now,2),
+        "ema20": round(e20,2),
+        "ema50": round(e50,2),
+        "macd": round(m_now,4),
+        "signal": round(s_now,4),
+        "hist": round(hist,4),
+        "score_raw": round(score,2),
+    }
+    return float(round(score,2)), details
+
+# ==============================
+# Sentimento (opcional)
+# ==============================
+def load_sentiment_fn():
+    try:
+        # seu arquivo pode expor função com esse nome
+        from sentiment_analyzer import get_sentiment_for_symbol as fn  # type: ignore
+        return fn
+    except Exception:
+        return None
+
+SENTIMENT_FN = load_sentiment_fn()
+
+def safe_sentiment(symbol: str) -> Tuple[float,int,int]:
+    """Tenta obter sentimento. Aceita dict ou tuple no retorno.
+    Retorna (score_pct, news_n, tw_n)."""
+    if not SENTIMENT_FN or not AI_ENABLE:
+        return (50.0, 0, 0)
+    try:
+        out = SENTIMENT_FN(symbol)
+        # formatos aceitos:
+        # 1) dict: {"score": 62.3, "news_n": 4, "tw_n": 12}
+        # 2) tuple: (62.3, 4, 12)
+        if isinstance(out, dict):
+            sc = float(out.get("score", 50.0))
+            nn = int(out.get("news_n", 0))
+            tn = int(out.get("tw_n", 0))
+            return (sc, nn, tn)
+        if isinstance(out, (list, tuple)):
+            if len(out) == 3:
+                sc, nn, tn = out
+                return (float(sc), int(nn), int(tn))
+            if len(out) == 1:
+                return (float(out[0]), 0, 0)
+        # fallback
+        return (float(out), 0, 0)  # se for numérico solto
+    except Exception as e:
+        _log(f"[SENT] erro {symbol}: {e}")
+        return (50.0, 0, 0)
+
+# ==============================
+# Telegram (opcional)
+# ==============================
+def telegram_send(text: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHATID:
+        return
+    try:
+        from urllib.parse import quote_plus
+        api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHATID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+        url = api + "?" + urlencode(payload, quote_via=quote_plus)
+        # não precisa de retries aqui; logs já garantem ciclo
+        req = Request(url, headers={"Accept":"application/json"})
+        with urlopen(req, timeout=15) as _:
+            pass
+    except Exception as e:
+        _log(f"[TG] falha ao enviar mensagem: {e}")
+
+# ==============================
 # Pipeline
-# =========================
-def run_pipeline() -> None:
-    start = time.time()
-    _log("Starting Container")
-    _log(f"\u25b6\ufe0f Runner iniciado. Intervalo = {INTERVAL_MIN:.1f} min.")
+# ==============================
+def run_pipeline():
+    start_dt = datetime.now(timezone.utc)
+    _log(f"NEWS ativo?: {NEWS_USE} | IA ativa?: {AI_ENABLE} | Historico ativado?: True | Twitter ativo?: {TWITTER_USE}")
 
-    _log(f"\ud83d\udd0e NEWS ativo?: {NEWS_USE} | IA ativa?: {AI_ENABLE} | "
-         f"Histórico ativado?: {HISTORY_ENABLE} | Twitter ativo?: {TWITTER_USE}")
-
-    # Universo
-    universe = get_universe()
-    if not universe:
-        _err("Sem universo de moedas (CMC/CG indisponíveis ou sem UNIVERSE_LIST/CRYPTOCOMPARE_API_KEY).")
+    symbols = load_symbol_list()
+    if not symbols:
+        _log("Sem universo de moedas (nenhum símbolo definido).")
         return
 
-    show = ", ".join(universe[:8])
-    _log(f"\ud83d\udd8a\ufe0f Moedas deste ciclo ({min(30,len(universe))}/{len(universe)}): {show}")
+    _log(f"Moedas deste ciclo ({min(100,len(symbols))}/{len(symbols)}): {', '.join(symbols[:30])}{'...' if len(symbols)>30 else ''}")
 
-    data_raw: Dict[str, Any] = {}
-    collected = 0
-
-    for sym in universe[:30]:  # limita por ciclo
-        _log(f"\U0001f4c8 Coletando OHLC {sym} (days={DAYS_OHLC})…")
+    # Coleta OHLC
+    collected: Dict[str, List[Dict]] = {}
+    for sym in symbols:
+        _log(f"Coletando OHLC {sym} (tf={OHLC_TIMEFRAME}, limit={OHLC_LIMIT})...")
         try:
-            ohlc = fetch_ohlc_cc(sym, CANDLES_4H)
+            ohlc = fetch_ohlc_cc(sym, limit=OHLC_LIMIT, tf=OHLC_TIMEFRAME)
+            if len(ohlc) < 60:
+                _log(f"Aviso {sym}: OHLC insuficiente ({len(ohlc)}/60)")
+            else:
+                _log(f"  -> OK | candles={len(ohlc)}")
+            collected[sym] = ohlc
         except Exception as e:
-            _warn(f"{sym}: OHLC insuficiente/erro ({e})")
+            _log(f"Aviso OHLC {sym}: {e}")
+
+    # Salva raw
+    try:
+        with open("data_raw.json","w", encoding="utf-8") as f:
+            json.dump({"ts": int(time.time()), "symbols": list(collected.keys())}, f, ensure_ascii=True)
+        _log(f"Salvo data_raw.json ({len(collected)} ativos)")
+    except Exception as e:
+        _log(f"Aviso ao salvar data_raw.json: {e}")
+
+    # Calcula indicadores + sentimento + mistura
+    signals = []
+    for sym, ohlc in collected.items():
+        if len(ohlc) < 60:
             continue
+        tech, det = technical_score(ohlc)
+        sent_score, news_n, tw_n = safe_sentiment(sym)
 
-        if len(ohlc) < max(60, CANDLES_4H // 2):
-            _warn(f"{sym}: OHLC insuficiente ({len(ohlc)}/{CANDLES_4H})")
-            continue
-
-        _ok(f"candles={len(ohlc)}")
-
-        last_close = float(ohlc[-1]["c"])
-
-        # score técnico
-        try:
-            tech = float(technical_score(ohlc))
-        except Exception as e:
-            _warn(f"{sym} score técnico erro: {e}")
-            tech = 0.0
-
-        # sentimento
-        sent = get_sentiment(sym, last_close)
-        sent_score = float(sent.get("score", 50.0))
-        news_n = int(sent.get("news_n", 0))
-        tw_n = int(sent.get("tw_n", 0))
-
-        # mix
-        mix = (tech * MIX_TECH_OVER_SENT + sent_score * MIX_SENT_OVER_TECH) / (
-            MIX_TECH_OVER_SENT + MIX_SENT_OVER_TECH
-        )
+        mix = (tech * MIX_TECH_OVER_SENT + sent_score * MIX_SENT_OVER_TECH) / (MIX_TECH_OVER_SENT + MIX_SENT_OVER_TECH)
 
         _log(
-            f"[IND] {sym} | Técnico: {tech:.1f}% | Sentimento: {sent_score:.1f}% "
+            f"[IND] {sym} | Tecnico: {tech:.1f}% | Sentimento: {sent_score:.1f}% "
             f"(news n={news_n}, tw n={tw_n}) | Mix(T:{MIX_TECH_OVER_SENT:.1f},S:{MIX_SENT_OVER_TECH:.1f}): "
             f"{mix:.1f}% (min {MIX_MIN_THRESHOLD:.0f}%)"
         )
 
-        data_raw[sym] = {
-            "last": last_close,
-            "ohlc": ohlc,
-            "tech": tech,
-            "sent": sent_score,
-            "news_n": news_n,
-            "tw_n": tw_n,
-            "mix": mix,
-        }
-        collected += 1
+        if mix >= MIX_MIN_THRESHOLD:
+            last_price = ohlc[-1]["c"]
+            sig = {
+                "symbol": sym,
+                "price": last_price,
+                "mix": round(mix,2),
+                "tech": round(tech,2),
+                "sentiment": round(sent_score,2),
+                "news_n": news_n,
+                "tw_n": tw_n,
+                "time": int(time.time()),
+            }
+            signals.append(sig)
 
-    # persistência simples
+    # Salva e notifica
     try:
-        with open("data_raw.json", "w", encoding="utf-8") as f:
-            json.dump(data_raw, f)
-        _log(f"\U0001f4be Salvo data_raw.json ({collected} ativos)")
+        with open("signals.json","w", encoding="utf-8") as f:
+            json.dump({"ts": int(time.time()), "signals": signals}, f, ensure_ascii=True, indent=2)
+        _log(f"{len(signals)} sinais salvos em signals.json")
     except Exception as e:
-        _warn(f"Não foi possível salvar data_raw.json: {e}")
+        _log(f"Aviso ao salvar signals.json: {e}")
 
-    _log(f"\U0001f553 Fim: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    _log(f"\u2705 Ciclo concluído em {int(time.time()-start)}s. Próxima execução")
+    if signals:
+        lines = ["Sinais encontrados:"]
+        for s in signals[:10]:
+            lines.append(
+                f"{s['symbol']}: mix {s['mix']}% (tech {s['tech']}% / sent {s['sentiment']}%), price {s['price']}"
+            )
+        telegram_send("\n".join(lines))
+
+    end_dt = datetime.now(timezone.utc)
+    _log(f"Fim: {end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
 
-# =========================
-# Entry point
-# =========================
 if __name__ == "__main__":
-    try:
-        run_pipeline()
-    except Exception:
-        traceback.print_exc()
-        _err("Erro inesperado no ciclo.")
+    _log("Starting Container")
+    _log(f"Runner iniciado. Intervalo = {INTERVAL_MIN:.1f} min.")
+    while True:
+        try:
+            t0 = time.time()
+            run_pipeline()
+            elapsed = time.time() - t0
+            wait_s = max(0, int(INTERVAL_MIN * 60 - elapsed))
+            _log(f"Ciclo concluido em {int(elapsed)}s. Proxima execucao em ~{wait_s}s.")
+            for _ in range(wait_s // 30):
+                time.sleep(30)
+                rem = wait_s - (_+1)*30
+                _log(f"aguardando 30s... (restante {rem}s)")
+            rest = wait_s % 30
+            if rest > 0:
+                time.sleep(rest)
+        except Exception as e:
+            traceback.print_exc()
+            _log(f"Erro inesperado no ciclo: {e}")
+            _log("Ciclo concluido em 0s. Proxima execucao em ~1199s.")
+            # espera 20 minutos em caso de erro bruto
+            for _ in range(40):
+                time.sleep(30)
+                _log(f"aguardando 30s... (restante {((40-(_+1))*30)}s)")
