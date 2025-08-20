@@ -1,74 +1,72 @@
+# history_manager.py
 # -*- coding: utf-8 -*-
-"""
-history_manager.py — utilitários de histórico/caches locais
 
-Fornece:
-- ensure_dir(path)
-- save_ohlc_symbol(symbol, bars, history_dir="data/history")
-    -> salva em HISTORY_DIR/ohlc/{SYMBOL}.json
-    -> formato: {"symbol": "...", "bars": [[ts,o,h,l,c], ...]}
-- load_ohlc_symbol(symbol, history_dir="data/history") -> lista de dicts padronizados
+"""
+Gerenciamento de histórico (OHLCV) com cache local.
+Inclui:
+- save_ohlc_cache(symbol, bars, path)   -> salva candles
+- load_ohlc_cache(symbol, path)         -> lê candles
+- clear_ohlc_cache(symbol, path)        -> limpa cache
 """
 
 import os
+import io
 import json
-from typing import List, Dict
+import time
+import threading
+from typing import List, Dict, Any, Optional
 
-DEFAULT_HISTORY_DIR = os.getenv("HISTORY_DIR", "data/history")
+_LOCK = threading.Lock()
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+def _ensure_dir(path: str) -> None:
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
-def _normalize_ohlc(rows: List) -> List[Dict[str, float]]:
-    out = []
-    if not rows:
-        return out
-    if isinstance(rows, list) and rows and isinstance(rows[0], list):
-        for r in rows:
-            if len(r) >= 5:
-                try:
-                    out.append({"t": float(r[0]), "o": float(r[1]), "h": float(r[2]),
-                                "l": float(r[3]), "c": float(r[4])})
-                except Exception:
-                    pass
-    elif isinstance(rows, list) and isinstance(rows[0], dict):
-        for r in rows:
-            try:
-                o = float(r.get("open", r.get("o", 0.0)))
-                h = float(r.get("high", r.get("h", 0.0)))
-                l = float(r.get("low",  r.get("l", 0.0)))
-                c = float(r.get("close",r.get("c", 0.0)))
-                t = float(r.get("t", r.get("time", 0.0)))
-                out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
-            except Exception:
-                pass
-    return out
+def _file_for_symbol(symbol: str, base_path: str) -> str:
+    """Gera caminho do cache para cada símbolo."""
+    sym = symbol.replace("/", "_").upper()
+    return os.path.join(base_path, f"{sym}_ohlc.json")
 
-def save_ohlc_symbol(symbol: str, bars: List[Dict[str, float]], history_dir: str = DEFAULT_HISTORY_DIR) -> str:
+def save_ohlc_cache(symbol: str,
+                    bars: List[Dict[str, Any]],
+                    path: str = "cache") -> None:
     """
-    Salva OHLC em HISTORY_DIR/ohlc/{SYMBOL}.json
-    bars pode ser lista de dicts {t,o,h,l,c} ou lista de listas [t,o,h,l,c].
+    Salva lista de candles (OHLCV) em JSON.
+    Cada bar deve ser dict com chaves: time, open, high, low, close, volume.
     """
-    ensure_dir(os.path.join(history_dir, "ohlc"))
-    # normaliza para lista de listas
-    norm = _normalize_ohlc(bars)
-    out_rows = [[b["t"], b["o"], b["h"], b["l"], b["c"]] for b in norm]
-    path = os.path.join(history_dir, "ohlc", f"{symbol}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"symbol": symbol, "bars": out_rows}, f, ensure_ascii=False)
-    return path
+    _ensure_dir(path)
+    fpath = _file_for_symbol(symbol, path)
+    data = {
+        "symbol": symbol,
+        "saved_at": int(time.time()),
+        "bars": bars or []
+    }
+    tmp = fpath + ".tmp"
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    with _LOCK:
+        with io.open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, fpath)
 
-def load_ohlc_symbol(symbol: str, history_dir: str = DEFAULT_HISTORY_DIR) -> List[Dict[str, float]]:
-    """
-    Lê HISTORY_DIR/ohlc/{SYMBOL}.json e devolve lista padronizada [{t,o,h,l,c},...]
-    """
-    path = os.path.join(history_dir, "ohlc", f"{symbol}.json")
-    if not os.path.exists(path):
-        return []
+def load_ohlc_cache(symbol: str,
+                    path: str = "cache") -> Optional[List[Dict[str, Any]]]:
+    """Lê candles salvos no cache. Retorna lista ou None se não existir."""
+    fpath = _file_for_symbol(symbol, path)
+    if not os.path.exists(fpath):
+        return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with io.open(fpath, "r", encoding="utf-8") as f:
             data = json.load(f)
-        rows = data.get("bars", data)
-        return _normalize_ohlc(rows)
+        return data.get("bars")
     except Exception:
-        return []
+        return None
+
+def clear_ohlc_cache(symbol: str,
+                     path: str = "cache") -> bool:
+    """Remove cache de um símbolo específico."""
+    fpath = _file_for_symbol(symbol, path)
+    if os.path.exists(fpath):
+        os.remove(fpath)
+        return True
+    return False
