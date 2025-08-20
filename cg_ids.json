@@ -28,5 +28,11 @@
   "ARBUSDT": "arbitrum",
   "LDOUSDT": "lido-dao",
   "ATOMUSDT": "cosmos",
-  "STXUSDT": "blockstack"
+  "STXUSDT": "stacks",
+  "RNDRUSDT": "render-token",
+  "ICPUSDT": "internet-computer",
+  "PEPEUSDT": "pepe",
+  "CROUSDT": "crypto-com-chain",
+  "MKRUSDT": "maker",
+  "TAOUSDT": "tao"
 }
