@@ -1,244 +1,179 @@
-# main.py
-# Runner orquestrador: universo (CMC), OHLC (CoinGecko), técnico leve,
-# sentimento (CryptoPanic + Twitter), e mix final. Salva data_raw.json.
+# -*- coding: utf-8 -*-
+"""
+main.py
+Runner principal com:
+- Universo via CoinMarketCap (CMC) com fallback para estáticos
+- OHLC via CryptoCompare (CC)
+- Logs compatíveis com seu formato anterior
+- Integração com seu sentiment_analyzer (se presente)
+"""
 
-import os, json, time, math, traceback
-from typing import List, Dict, Any
+import os
+import json
+import time
 from datetime import datetime, timezone
 
-# ----- ENV -----
-RUN_INTERVAL_MIN = float(os.getenv("RUN_INTERVAL_MIN", "20"))
-TOP_N = int(os.getenv("TOP_SYMBOLS", "100"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "30"))
+# --------- FLAGS / CONFIG ---------
+CYCLE_LIMIT = int(os.getenv("CYCLE_COINS_LIMIT", "100"))      # até 100 moedas
+DAYS = int(os.getenv("OHLC_DAYS", "30"))                      # janela
+MIN_CANDLES = int(os.getenv("MIN_CANDLES", "60"))             # mínimo p/ aceitar
+INTERVAL = os.getenv("OHLC_INTERVAL", "4h")                   # 4h ou 1d
 
-NEWS_USE = os.getenv("NEWS_USE", "true").lower() == "true"
-AI_ACTIVE = os.getenv("AI_ACTIVE", "true").lower() == "true"
-HISTORY_USE = os.getenv("HISTORY_USE", "true").lower() == "true"
-TWITTER_USE = os.getenv("TWITTER_USE", "true").lower() == "true"
+USE_NEWS = os.getenv("NEWS_USE", "true").lower() == "true"
+USE_TW   = os.getenv("TWITTER_USE", "true").lower() == "true"
+USE_AI   = os.getenv("IA_USE", "true").lower() == "true"
+USE_HISTORY = os.getenv("HISTORY_USE", "true").lower() == "true"
 
 MIX_TECH_OVER_SENT = float(os.getenv("MIX_TECH_OVER_SENT", "1.5"))
 MIX_SENT_OVER_TECH = float(os.getenv("MIX_SENT_OVER_TECH", "1.0"))
-MIX_MIN_THRESHOLD = float(os.getenv("MIX_MIN_THRESHOLD", "70.0"))
+MIX_MIN_THRESHOLD  = float(os.getenv("MIX_MIN_THRESHOLD", "70"))
 
-# ----- Dependências (CG + CMC + sentimento) -----
+# --------- IMPORTS LOCAIS ---------
 try:
-    from data_fetcher_coingecko import fetch_ohlc as cg_fetch_ohlc, fetch_top_symbols as cg_top
+    from data_fetcher_cmc import get_universe
 except Exception:
-    cg_fetch_ohlc, cg_top = None, None
+    get_universe = None
 
 try:
-    from cmc_client import get_top_symbols as cmc_top, get_quote_usd as cmc_quote
+    from data_fetcher_cc import fetch_ohlc_cc
 except Exception:
-    cmc_top, cmc_quote = None, None
+    fetch_ohlc_cc = None
 
-from sentiment_analyzer import get_sentiment_for_symbol
+# Indicadores/estratégias (mantém teu pipeline se existir)
+_compute_indicators = None
+try:
+    from apply_strategies import score_from_indicators as _compute_indicators
+except Exception:
+    pass  # se não existir, calculamos score simples
 
-STABLES = {"USDT", "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "PYUSD", "EUR", "BRL"}
+# Sentimento (usa teu módulo se existir)
+_get_sentiment = None
+try:
+    from sentiment_analyzer import get_sentiment_for_symbol as _get_sentiment
+except Exception:
+    pass
 
-def _log(msg: str):
-    print(msg, flush=True)
-
+# ---------- UTILS/LOG ----------
+def _log(msg: str): print(msg, flush=True)
 def _now_utc_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def _remove_stables(symbols: List[str]) -> List[str]:
-    out = []
-    seen = set()
-    for s in symbols:
-        s = s.upper()
-        if s in seen:
-            continue
-        seen.add(s)
-        # remove pares redundantes tipo FDUSDUSDT etc.
-        if any(stab in s[:-4] for stab in STABLES):
-            continue
-        if not s.endswith("USDT"):
-            continue
-        out.append(s)
-    # remove duplicadas por base (ex: FDUSDUSDT redundante)
-    return out
+# ---------- UNIVERSO ----------
+STATIC_FALLBACK = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","ADAUSDT","DOGEUSDT","TRXUSDT",
+    "AVAXUSDT","LINKUSDT","MATICUSDT","TONUSDT","SHIBUSDT","DOTUSDT","LTCUSDT","UNIUSDT",
+    "BCHUSDT","ETCUSDT","APTUSDT","IMXUSDT","FILUSDT","NEARUSDT","OPUSDT","XLMUSDT",
+]
 
-def _get_universe() -> List[str]:
-    # Preferimos CMC
-    if cmc_top:
+def load_universe(limit:int) -> list:
+    coins = []
+    # tenta CMC
+    if get_universe:
         try:
-            return _remove_stables(cmc_top(TOP_N))
-        except Exception:
-            pass
-    # Fallback CoinGecko se houver
-    if cg_top:
-        try:
-            return _remove_stables(cg_top(TOP_N) or [])
-        except Exception:
-            pass
-    return []
+            coins = get_universe(limit=limit)
+        except Exception as e:
+            _log(f"⚠️  CMC indisponível: {e}")
+    # fallback estático
+    if not coins:
+        coins = STATIC_FALLBACK[:limit]
+    return coins
 
-# ---------- Técnico leve (EMA/RSI/BB) ----------
-def _ema(values: List[float], n: int) -> float:
-    if not values or n <= 1 or len(values) < n:
-        return values[-1] if values else 0.0
-    k = 2 / (n + 1)
-    ema = values[0]
-    for v in values[1:]:
-        ema = v * k + ema * (1 - k)
-    return ema
+# ---------- OHLC ----------
+def fetch_ohlc(symbol: str, days:int, interval:str):
+    if not fetch_ohlc_cc:
+        raise RuntimeError("data_fetcher_cc não disponível")
+    return fetch_ohlc_cc(symbol, days=days, interval=interval)
 
-def _rsi(values: List[float], n: int = 14) -> float:
-    if len(values) < n + 1:
-        return 50.0
-    gains = []
-    losses = []
-    for i in range(1, n + 1):
-        ch = values[-i] - values[-i-1]
-        gains.append(max(0.0, ch))
-        losses.append(max(0.0, -ch))
-    avg_gain = sum(gains) / n
-    avg_loss = sum(losses) / n
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
-
-def _bb(values: List[float], n: int = 20):
-    if len(values) < n:
-        mid = sum(values)/max(1,len(values))
-        return mid, mid, mid
-    arr = values[-n:]
-    mid = sum(arr)/n
-    var = sum((x-mid)**2 for x in arr)/n
-    sd = math.sqrt(max(0.0, var))
-    return mid, mid - 2*sd, mid + 2*sd
-
-def _technical_score_from_closes(closes: List[float]) -> float:
-    if not closes:
+# ---------- TÉCNICO (fallback simples se apply_strategies não existir) ----------
+def _naive_score_from_prices(ohlc: list) -> float:
+    if len(ohlc) < 14:
         return 0.0
-    close = closes[-1]
-    ema20 = _ema(closes[-60:], 20)
-    ema50 = _ema(closes[-120:], 50) if len(closes) >= 120 else _ema(closes, max(2, len(closes)//2))
-    rsi14 = _rsi(closes, 14)
-    bb_mid, bb_lo, bb_hi = _bb(closes, 20)
+    closes = [r[4] for r in ohlc]
+    # RSI simples (Wilder-like) p/ ter algo quando faltar teu módulo:
+    gains, losses = 0.0, 0.0
+    for i in range(1,15):
+        delta = closes[-i] - closes[-i-1]
+        if delta >= 0: gains += delta
+        else: losses -= delta
+    if losses == 0:
+        rsi = 70.0
+    else:
+        rs = (gains/14.0)/(losses/14.0)
+        rsi = 100 - (100/(1+rs))
+    # score heurístico só p/ não zerar (quanto mais sobrevendido, maior score)
+    score = max(0.0, min(100.0, (50.0 - abs(rsi-50))*2))
+    return score
 
-    score = 0.0
-    # EMA alinhadas
-    if close > ema20: score += 15
-    if ema20 > ema50: score += 15
-    # RSI na zona "ok"
-    if 45 <= rsi14 <= 60: score += 15
-    elif rsi14 > 60: score += 10
-    elif rsi14 < 40: score += 5
-    # Bollinger: mais perto do meio/alta
-    if bb_hi != bb_lo:
-        pos = (close - bb_lo) / (bb_hi - bb_lo)  # 0..1
-        score += max(0.0, min(1.0, pos)) * 20
-    # momentum simples
-    if len(closes) >= 10 and close > closes[-10]:
-        score += 20
-    # clamp 0..100
-    return max(0.0, min(100.0, score))
-
-# ---------- OHLC via CoinGecko ----------
-def _fetch_ohlc(symbol: str, days: int = 30) -> List[Dict[str, Any]]:
-    """
-    Espera que data_fetcher_coingecko.fetch_ohlc(sym, days) exista.
-    Converte para [{'t':..., 'o':...,'h':...,'l':...,'c':...}, ...]
-    """
-    if not cg_fetch_ohlc:
-        return []
-    try:
-        candles = cg_fetch_ohlc(symbol, days=days)  # formato das tuplas esperado (t,o,h,l,c) ou similar
-    except Exception:
-        return []
-    out = []
-    # Aceita lista de listas/tuplas [t,o,h,l,c] ou dicts; normaliza:
-    for it in candles or []:
-        if isinstance(it, dict):
-            t = it.get("t") or it.get("time") or it.get("ts")
-            o = it.get("o"); h = it.get("h"); l = it.get("l"); c = it.get("c")
-        else:
-            # tenta [t,o,h,l,c]
-            try:
-                t, o, h, l, c = it[0], it[1], it[2], it[3], it[4]
-            except Exception:
-                continue
+def compute_tech_score(symbol:str, ohlc:list) -> float:
+    if _compute_indicators:
         try:
-            out.append({"t": int(t), "o": float(o), "h": float(h), "l": float(l), "c": float(c)})
-        except Exception:
-            continue
-    return out
+            return float(_compute_indicators(symbol, ohlc))  # tua função existente
+        except Exception as e:
+            _log(f"⚠️  IND erro {symbol}: {e}")
+    return _naive_score_from_prices(ohlc)
 
-def _closes(ohlc: List[Dict[str,Any]]) -> List[float]:
-    return [x["c"] for x in ohlc if "c" in x]
+# ---------- SENTIMENTO ----------
+def compute_sentiment(symbol:str) -> dict:
+    if _get_sentiment:
+        try:
+            return _get_sentiment(symbol) or {"score":50.0,"news_n":0,"tw_n":0}
+        except Exception as e:
+            _log(f"[SENT] erro {symbol}: {e}")
+    return {"score":50.0,"news_n":0,"tw_n":0}
 
-# ---------- RUN ----------
+# ---------- PIPELINE ----------
 def run_pipeline():
-    _log(f"▶️ Runner iniciado. Intervalo = {RUN_INTERVAL_MIN:.1f} min.")
-    _log(f"🔎 NEWS ativo?: {NEWS_USE} | IA ativa?: {AI_ACTIVE} | Histórico ativado?: {HISTORY_USE} | Twitter ativo?: {TWITTER_USE}")
+    _log("Starting Container")
+    _log(f"▶️ Runner iniciado. Intervalo = {float(os.getenv('RUN_INTERVAL_MIN','20')):.1f} min.")
+    _log(f"🔎 NEWS ativo?: {USE_NEWS} | IA ativa?: {USE_AI} | Histórico ativado?: {USE_HISTORY} | Twitter ativo?: {USE_TW}")
 
-    symbols = _get_universe()
-    symbols = symbols[:TOP_N]
+    symbols = load_universe(CYCLE_LIMIT)
     if not symbols:
         _log("❌ Sem universo de moedas (CMC/CG indisponíveis).")
         return
 
-    _log(f"🧪 Moedas deste ciclo ({min(len(symbols), TOP_N)}/{TOP_N}): " + ", ".join(symbols[:min(30, len(symbols))]) + ("..." if len(symbols) > 30 else ""))
+    _log(f"🧪 Moedas deste ciclo ({min(len(symbols), CYCLE_LIMIT)}/{CYCLE_LIMIT}): " + ", ".join(symbols[:30]) + ("..." if len(symbols)>30 else ""))
 
     collected = {}
-    ok_count = 0
-
-    for sym in symbols[:BATCH_SIZE]:
-        _log(f"📊 Coletando OHLC {sym} (days=30)…")
-        ohlc = _fetch_ohlc(sym, days=30)
-        closes = _closes(ohlc)
-        if len(closes) < 60:
-            _log(f"⚠️ {sym}: OHLC insuficiente ({len(closes)}/60)")
-        else:
-            _log("   → OK | candles= 180" if len(ohlc) >= 180 else f"   → OK | candles= {len(ohlc)}")
-            ok_count += 1
-        collected[sym] = {"ohlc": ohlc}
-
-    # Salva bruto
-    try:
-        with open("data_raw.json", "w", encoding="utf-8") as f:
-            json.dump({"symbols": list(collected.keys()), "data": collected}, f)
-        _log(f"💾 Salvo data_raw.json ({len(collected)} ativos)")
-    except Exception:
-        _log("⚠️ Não foi possível salvar data_raw.json")
-
-    # Processa técnico + sentimento
-    for sym, d in collected.items():
-        closes = _closes(d["ohlc"])
-        last_price = closes[-1] if closes else None
-        if last_price is None and cmc_quote:
-            try:
-                last_price = cmc_quote(sym)
-            except Exception:
-                last_price = None
-
-        tech = _technical_score_from_closes(closes) if closes else 0.0
-
-        sent = {"score": 50.0, "news_n": 0, "tw_n": 0}
+    for sym in symbols:
+        _log(f"📊 Coletando OHLC {sym} (days={DAYS})…")
         try:
-            sent = get_sentiment_for_symbol(sym, last_price=last_price)
-        except TypeError:
-            # compat de assinaturas antigas
-            sent = get_sentiment_for_symbol(sym)
+            rows = fetch_ohlc(sym, DAYS, INTERVAL)
+            n = len(rows)
+            if n < MIN_CANDLES:
+                _log(f"⚠️ {sym}: OHLC insuficiente ({n}/{MIN_CANDLES})")
+                continue
+            _log(f"   → OK | candles= {n}")
+            collected[sym] = rows
         except Exception as e:
-            _log(f"[SENT] erro {sym}: {e}")
+            _log(f"⚠️ {sym}: OHLC falhou: {e}")
 
+    # salva cache bruto
+    try:
+        with open("data_raw.json","w",encoding="utf-8") as f:
+            json.dump({k: v[-300:] for k,v in collected.items()}, f)
+        _log(f"💾 Salvo data_raw.json ({len(collected)} ativos)")
+    except Exception as e:
+        _log(f"⚠️ Erro ao salvar data_raw.json: {e}")
+
+    # indicadores + sentimento
+    for sym, ohlc in collected.items():
+        tech = float(compute_tech_score(sym, ohlc) or 0.0)
+        sent = compute_sentiment(sym)
         sent_score = float(sent.get("score", 50.0))
         news_n = int(sent.get("news_n", 0))
         tw_n = int(sent.get("tw_n", 0))
 
         mix = (tech * MIX_TECH_OVER_SENT + sent_score * MIX_SENT_OVER_TECH) / (MIX_TECH_OVER_SENT + MIX_SENT_OVER_TECH)
 
-        _log(f"[IND] {sym} | Técnico: {tech:.1f}% | Sentimento: {sent_score:.1f}% (news n={news_n}, tw n={tw_n}) | Mix(T:{MIX_TECH_OVER_SENT:.1f},S:{MIX_SENT_OVER_TECH:.1f}): {mix:.1f}% (min {MIX_MIN_THRESHOLD:.0f}%)")
+        _log(f"[IND] {sym} | Técnico: {tech:.1f}% | Sentimento: {sent_score:.1f}% (news n={news_n}, tw n={tw_n}) | "
+             f"Mix(T:{MIX_TECH_OVER_SENT:.1f},S:{MIX_SENT_OVER_TECH:.1f}): {mix:.1f}% (min {MIX_MIN_THRESHOLD:.0f}%)")
 
     _log(f"🕒 Fim: {_now_utc_str()}")
-    _log("✅ Ciclo concluído. Próxima execução")
-    # (O runner externo já reexecuta no intervalo; aqui só finalizamos.)
+    _log("✅ Ciclo concluído.")
 
 if __name__ == "__main__":
     try:
         run_pipeline()
-    except Exception:
-        traceback.print_exc()
+    except Exception as e:
+        _log(f"❌ Erro inesperado: {e}")
