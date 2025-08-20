@@ -1,69 +1,128 @@
 # -*- coding: utf-8 -*-
 """
-data_fetcher_binance.py — OHLC via Binance REST (sem SDK).
+data_fetcher_binance.py
+Coleta OHLC da Binance com rotação de endpoints (api-gcp, api, api1..api4),
+detecção de HTTP 451 (geo-block) e backoff.
 
-Retorna lista de [ts,o,h,l,c] em minuto/hora diário (usamos diário).
-Em caso de HTTP 451 (bloqueio regional), a exceção propaga para o caller
-que fará fallback pro CoinGecko.
-
-Env:
-  BINANCE_BASE = https://api.binance.com (padrão)
-  BINANCE_INTERVAL = 1d
+Retorno: lista [[ts_sec, open, high, low, close], ...] em ordem cronológica.
 """
 
-import os
-import json
 import time
-import urllib.request
-import urllib.error
-from typing import List
+import math
+import json
+from datetime import datetime, timedelta
+from urllib import request, parse, error
 
-BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com")
-INTERVAL = os.getenv("BINANCE_INTERVAL", "1d")
+# Endpoints em ordem de preferência
+BINANCE_HOSTS = [
+    "https://api-gcp.binance.com",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
 
-def _sleep_backoff(i: int):
-    # 5s, 11s, 24s, 53s, 117s, 257s…
-    waits = [5, 11, 24, 53, 117, 257]
-    time.sleep(waits[min(i, len(waits)-1)])
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
-def fetch_ohlc_binance(symbol: str, days: int) -> List[List[float]]:
+class GeoBlocked(Exception):
+    pass
+
+def _http_get(url: str, qs: dict, timeout=20):
+    q = parse.urlencode(qs)
+    full = f"{url}?{q}"
+    req = request.Request(full, headers={"User-Agent": UA, "Accept": "application/json"})
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except error.HTTPError as e:
+        # 451: indisponível por razões legais (geo/região)
+        if e.code == 451:
+            raise GeoBlocked("HTTP 451 (geo-block)") from e
+        raise
+    except Exception:
+        raise
+
+def _interval_to_ms(interval: str) -> int:
+    """Converte '1h','4h','1d','15m' para milissegundos."""
+    unit = interval[-1]
+    val = int(interval[:-1])
+    if unit == "m":
+        return val * 60_000
+    if unit == "h":
+        return val * 3_600_000
+    if unit == "d":
+        return val * 86_400_000
+    raise ValueError(f"Intervalo inválido: {interval}")
+
+def _bars_needed(days: int, interval: str) -> int:
+    ms = days * 86_400_000
+    step = _interval_to_ms(interval)
+    return max(1, math.ceil(ms / step))
+
+def _get_klines(host: str, symbol: str, interval: str, limit: int = 1000,
+                end_time_ms: int | None = None):
+    url = f"{host}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if end_time_ms:
+        params["endTime"] = end_time_ms
+    raw = _http_get(url, params)
+    data = json.loads(raw.decode("utf-8"))
+    # Cada item: [openTime, open, high, low, close, volume, closeTime, ...]
+    out = []
+    for r in data:
+        ts_sec = int(r[0] // 1000)
+        o = float(r[1]); h = float(r[2]); l = float(r[3]); c = float(r[4])
+        out.append([ts_sec, o, h, l, c])
+    return out
+
+def fetch_ohlc(symbol: str, days: int = 30, interval: str = "1h"):
     """
-    Pega klines diárias suficientes (~days*6 para margem)
-    Retorna lista de [ts, o, h, l, c]
+    Tenta baixar OHLC de vários hosts da Binance com fallback.
+    Retorna [[ts,o,h,l,c], ...] (ordem cronológica). Pode retornar [] se todos falharem.
     """
-    limit = max(100, min(1500, days * 6))
-    url = f"{BINANCE_BASE}/api/v3/klines?symbol={symbol}&interval={INTERVAL}&limit={limit}"
+    need = _bars_needed(days, interval)
+    page_limit = 1000  # limite máximo da API
+    collected: list[list[float]] = []
 
-    last_err = None
-    for attempt in range(6):
+    # endTime começa "agora" e vai voltando para trás
+    end_time_ms = int(time.time() * 1000)
+
+    def _try_on_host(host: str) -> bool:
+        nonlocal end_time_ms, collected
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                if resp.status != 200:
-                    raise urllib.error.HTTPError(url, resp.status, "HTTP error", resp.headers, None)
-                raw = json.loads(resp.read().decode("utf-8"))
-            out = []
-            for k in raw:
-                # kline: [ openTime, open, high, low, close, volume, closeTime, ... ]
-                t = float(k[0]) / 1000.0
-                o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
-                out.append([t, o, h, l, c])
-            return out
-        except urllib.error.HTTPError as he:
-            if he.code == 451:
-                raise RuntimeError("HTTP 451")
-            last_err = he
-            print(f"⚠️ Binance {BINANCE_BASE}: HTTP {he.code} — aguardando {_backoff_secs(attempt)}s (tentativa {attempt+1}/6)")
-            _sleep_backoff(attempt)
+            # Enquanto faltar barra, pagina
+            while len(collected) < need:
+                got = _get_klines(host, symbol, interval, limit=min(page_limit, need - len(collected)),
+                                  end_time_ms=end_time_ms)
+                if not got:
+                    break
+                collected = got + collected  # prefixa para manter ordem cronológica depois
+                # Novo endTime = openTime da primeira barra - 1ms
+                open_ms = (got[0][0]) * 1000
+                end_time_ms = open_ms - 1
+            return True
+        except GeoBlocked:
+            print(f"⚠️ Binance {host}: HTTP 451 — bloqueado")
+            return False
         except Exception as e:
-            last_err = e
-            print(f"⚠️ Binance erro {symbol}: {e} — aguardando {_backoff_secs(attempt)}s (tentativa {attempt+1}/6)")
-            _sleep_backoff(attempt)
+            print(f"⚠️ Binance {host}: {e}")
+            return False
 
-    if last_err:
-        raise last_err
-    return []
+    # Tenta hosts em ordem, com backoff pequeno entre eles
+    for i, host in enumerate(BINANCE_HOSTS):
+        ok = _try_on_host(host)
+        if ok and len(collected) >= min(60, need):  # pelo menos 60 velas (compatível com teu MIN_BARS)
+            break
+        # pequeno backoff progressivo antes do próximo host
+        time.sleep(1.5 * (i + 1))
 
-def _backoff_secs(i: int) -> int:
-    waits = [5, 11, 24, 53, 117, 257]
-    return waits[min(i, len(waits)-1)]
+    # Ordena e corta ao tamanho necessário
+    collected.sort(key=lambda x: x[0])
+    if len(collected) > need:
+        collected = collected[-need:]
+
+    return collected
