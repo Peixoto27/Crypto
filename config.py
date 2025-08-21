@@ -37,7 +37,7 @@ CCXT_RATE_LIMIT_MS  = _int("CCXT_RATE_LIMIT_MS", "1200")
 
 # ---------- Arquivos ----------
 DATA_RAW_FILE       = os.getenv("DATA_RAW_FILE", "data_raw.json")
-SIGNALS_FILE        = os.getenv("SIGNALS_FILE", "signals.json")
+SIGNALS_FILE        = os.getenv("SIGNALS_FILE", "data/signals.json")
 HISTORY_FILE        = os.getenv("HISTORY_FILE", "history.json")
 MODEL_FILE          = os.getenv("MODEL_FILE", "model.pkl")
 POSITIONS_FILE      = os.getenv("POSITIONS_FILE", "positions.json")
