@@ -1,148 +1,72 @@
 # notifier_telegram.py
-# Envio de mensagens para o Telegram com leitura robusta de variáveis de ambiente.
-# Compatível com BOT_TOKEN/TELEGRAM_BOT_TOKEN e CHAT_ID/TELEGRAM_CHAT_ID.
-
-from __future__ import annotations
-
 import os
-import time
-import json
-from typing import Iterable, Mapping, Any, Optional
-
 import requests
+from dotenv import load_dotenv
 
-# ----------------------------
-# Leitura de ENV (tolerante)
-# ----------------------------
-def _env(name: str) -> Optional[str]:
-    v = os.getenv(name)
-    return v.strip() if isinstance(v, str) else v
+# Carrega .env da pasta atual
+load_dotenv()
 
-def _env_bool(name: str, default: bool = True) -> bool:
-    raw = _env(name)
-    if raw is None:
-        return default
-    raw = raw.lower()
-    return raw not in {"0", "false", "no", "off", ""}
+# Aceita tanto TELEGRAM_* quanto os nomes curtos BOT_TOKEN / CHAT_ID
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 
-# aceita os dois padrões de nomes
-BOT_TOKEN = _env("BOT_TOKEN") or _env("TELEGRAM_BOT_TOKEN")
-CHAT_ID = _env("CHAT_ID") or _env("TELEGRAM_CHAT_ID")
-
-# pode existir no .env (se não existir, assume True)
-TELEGRAM_USE = _env_bool("TELEGRAM_USE", True)
-
-# Timeout e tentativas
-TG_TIMEOUT = float(os.getenv("TG_TIMEOUT", "15"))
-TG_MAX_RETRY = int(os.getenv("TG_MAX_RETRY", "3"))
-TG_RETRY_SLEEP = float(os.getenv("TG_RETRY_SLEEP", "1.5"))
+API_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage" if TOKEN else None
 
 def _enabled() -> bool:
-    if not TELEGRAM_USE:
-        _log("Telegram desativado por TELEGRAM_USE=false.")
-        return False
-    if not BOT_TOKEN or not CHAT_ID:
-        _log("Telegram não configurado (BOT_TOKEN/CHAT_ID ausentes).")
-        return False
-    return True
+    return bool(TOKEN and CHAT_ID)
 
-def _api_url(method: str) -> str:
-    return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-
-def _log(msg: str) -> None:
-    # imprime algo visível nos logs, sem quebrar unicode
-    try:
-        print(f"[TG] {msg}", flush=True)
-    except Exception:
-        pass
-
-# ----------------------------
-# Envio básico de texto
-# ----------------------------
-def send_message(
-    text: str,
-    parse_mode: Optional[str] = "HTML",
-    disable_web_page_preview: bool = True,
-    disable_notification: bool = False,
-) -> bool:
-    """
-    Envia uma mensagem de texto ao chat configurado.
-    Retorna True se enviado, False caso contrário.
-    """
+def send_message(text: str, parse_mode: str | None = "Markdown", disable_web_page_preview: bool = True) -> bool:
+    """Envia uma mensagem simples via Telegram."""
     if not _enabled():
+        print("[TG] Telegram desativado (BOT_TOKEN/CHAT_ID faltando).")
+        return False
+    try:
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": disable_web_page_preview,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+
+        r = requests.post(API_URL, data=payload, timeout=15)
+        ok = r.status_code == 200 and r.json().get("ok", False)
+        if ok:
+            print("[TG] Mensagem enviada.")
+        else:
+            print(f"[TG] Falha ({r.status_code}): {r.text[:200]}")
+        return ok
+    except Exception as e:
+        print(f"[TG] Erro ao enviar: {e}")
         return False
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text if isinstance(text, str) else str(text),
-        "disable_web_page_preview": disable_web_page_preview,
-        "disable_notification": disable_notification,
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-
-    last_err = None
-    for attempt in range(1, TG_MAX_RETRY + 1):
-        try:
-            r = requests.post(
-                _api_url("sendMessage"),
-                data=payload,
-                timeout=TG_TIMEOUT,
-            )
-            if r.ok:
-                return True
-            # erros de rate limit / flood control
-            if r.status_code == 429:
-                retry_after = r.json().get("parameters", {}).get("retry_after", TG_RETRY_SLEEP)
-                _log(f"Rate limited. Aguardando {retry_after}s… (tentativa {attempt}/{TG_MAX_RETRY})")
-                time.sleep(float(retry_after))
-                continue
-            # outros erros HTTP
-            last_err = f"HTTP {r.status_code}: {r.text}"
-            _log(f"Falha HTTP ao enviar: {last_err}")
-        except Exception as e:
-            last_err = repr(e)
-            _log(f"Erro ao enviar: {last_err}")
-        time.sleep(TG_RETRY_SLEEP)
-
-    _log(f"Falha final ao enviar mensagem. Último erro: {last_err}")
-    return False
-
-# aliases comuns (para não quebrar chamadas antigas)
-def send(text: str, **kwargs) -> bool:
-    return send_message(text, **kwargs)
-
-def notify(text: str, **kwargs) -> bool:
-    return send_message(text, **kwargs)
-
-def send_telegram_message(text: str, **kwargs) -> bool:
-    return send_message(text, **kwargs)
-
-# ----------------------------
-# Helpers para enviar “sinais”
-# ----------------------------
-def format_signal_row(sig: Mapping[str, Any]) -> str:
+def send_signal_notification(sig) -> bool:
     """
-    Espera dict com chaves como: symbol, tech_score, ai_score, mix_score, reason etc.
-    Monta uma linha legível para Telegram.
+    Envia notificação formatada de 1 sinal (ou lista de sinais).
+    Espera dict com chaves como: symbol, action, mix_score, tech_score, ai_score, price.
     """
-    sym = sig.get("symbol", "?")
-    t = sig.get("tech_score", sig.get("tech", sig.get("T", "")))
-    a = sig.get("ai_score", sig.get("ai", sig.get("A", "")))
-    m = sig.get("mix_score", sig.get("mix", sig.get("M", "")))
-    reason = sig.get("reason", "")
-    return f"<b>{sym}</b> | Técnico: <code>{t}</code> | IA: <code>{a}</code> | Mix: <b>{m}</b> {reason}"
+    if isinstance(sig, (list, tuple)):
+        ok = True
+        for s in sig:
+            ok = send_signal_notification(s) and ok
+        return ok
 
-def notify_signals(signals: Iterable[Mapping[str, Any]]) -> bool:
-    """
-    Envia uma lista de sinais agregados em uma única mensagem.
-    """
-    items = list(signals or [])
-    if not items:
-        return True  # nada a enviar, mas não é erro
+    symbol = (sig or {}).get("symbol") or (sig or {}).get("pair") or "????"
+    action = (sig or {}).get("action") or "BUY"
+    direction = "🟢 COMPRA" if action.upper().startswith("B") else "🔴 VENDA"
 
-    lines = ["<b>📣 Sinais gerados</b>"]
-    for s in items:
-        lines.append("• " + format_signal_row(s))
+    mix = (sig or {}).get("mix_score")
+    tech = (sig or {}).get("tech_score")
+    ai   = (sig or {}).get("ai_score")
+    price = (sig or {}).get("price")
 
-    return send_message("\n".join(lines), parse_mode="HTML")
+    parts = [
+        f"*{direction} {symbol}*",
+        f"Mix: {mix:.1f}%" if isinstance(mix, (int, float)) else None,
+        f"Técnico: {tech:.1f}%" if isinstance(tech, (int, float)) else None,
+        f"IA: {ai:.1f}%" if isinstance(ai, (int, float)) else None,
+        f"Preço: {price}" if price is not None else None,
+    ]
+    text = "\n".join(p for p in parts if p)
+
+    return send_message(text)
