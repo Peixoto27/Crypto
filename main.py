@@ -1,28 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-main.py — pipeline principal (estável)
-- Seleciona universo de moedas (fixo via env ou dinâmico via CoinGecko)
-- Rotaciona LOTES por ciclo (cursor em scan_state.json)
-- Coleta OHLC (CoinGecko e fallback CryptoCompare se disponível)
+main.py — pipeline principal (robusto a faltas de fetch_top_symbols)
+
+- Seleciona universo (SYMBOLS do env; se vazio tenta fetch_top_symbols; senão lista fallback)
+- Rotaciona lotes por ciclo (scan_state.json)
+- Coleta OHLC (CoinGecko e, se existir, CryptoCompare)
 - Calcula score técnico
-- (Opcional) mistura com IA se houver modelo carregado
-- Gera plano (entry/tp/sl), evita duplicados, notifica no Telegram
-- Salva caches OHLC por símbolo e data_raw.json para debug
+- (Opcional) mistura com IA se houver modelo (model_manager)
+- Gera plano (entry/tp/sl), evita duplicados, notifica Telegram
+- Salva cache OHLC por símbolo (history_manager) e data_raw.json
 """
 
 import os
 import json
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 # -----------------------------
 # Fetchers de mercado
 # -----------------------------
-from data_fetcher_coingecko import fetch_ohlc as cg_fetch_ohlc, fetch_top_symbols
+# import obrigatório: fetch_ohlc do CoinGecko
+from data_fetcher_coingecko import fetch_ohlc as cg_fetch_ohlc  # <- seu fetcher atual
+
+# import opcional: fetch_top_symbols pode NÃO existir no seu arquivo
 try:
-    # opcional: só será usado se o arquivo existir no projeto
-    from data_fetcher_cryptocompare import fetch_ohlc_cc as cc_fetch_ohlc
+    from data_fetcher_coingecko import fetch_top_symbols as cg_fetch_top_symbols  # type: ignore
+except Exception:
+    cg_fetch_top_symbols = None  # vamos criar fallback
+
+# import opcional: CryptoCompare (se você tiver esse arquivo)
+try:
+    from data_fetcher_cryptocompare import fetch_ohlc_cc as cc_fetch_ohlc  # type: ignore
 except Exception:
     cc_fetch_ohlc = None
 
@@ -67,9 +76,9 @@ MIN_BARS           = int(os.getenv("MIN_BARS", "180"))
 SCORE_THRESHOLD    = float(os.getenv("SCORE_THRESHOLD", "0.70"))  # 0..1
 MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "0.70"))   # 0..1
 
-# Pesos Técnico x IA (sem sentimento)
+# Pesos Técnico x IA
 WEIGHT_TECH        = float(os.getenv("WEIGHT_TECH", "1.0"))
-WEIGHT_AI          = float(os.getenv("WEIGHT_AI", "0.0"))          # 0 = ignora IA
+WEIGHT_AI          = float(os.getenv("WEIGHT_AI", "0.0"))
 
 # Anti-duplicados
 COOLDOWN_HOURS       = float(os.getenv("COOLDOWN_HOURS", "6"))
@@ -81,13 +90,13 @@ HISTORY_DIR        = os.getenv("HISTORY_DIR", "data/history")
 CURSOR_FILE        = os.getenv("CURSOR_FILE", "scan_state.json")
 SIGNALS_FILE       = os.getenv("SIGNALS_FILE", "signals.json")
 
-# Logs de recursos (apenas exibição de status)
+# Flags de status (apenas log)
 USE_NEWS           = _as_bool("USE_RSS_NEW", "false") or _as_bool("USE_THENEWSAPI", "false")
 USE_TWITTER        = _as_bool("USE_TWITTER", "false")
 USE_AI             = _as_bool("USE_AI", "true")
 TRAINING_ENABLED   = _as_bool("TRAINING_ENABLED", "true")
 
-# Opcional: remover pares estáveis redundantes
+# Remoção de pares estáveis redundantes (ex.: FDUSDUSDT)
 REMOVE_STABLES     = _as_bool("REMOVE_STABLES", "true")
 STABLE_SUFFIXES    = ("USDT", "FDUSD", "USDC", "BUSD", "TUSD")
 
@@ -153,7 +162,6 @@ def _is_stable_pair(symbol: str) -> bool:
     if not REMOVE_STABLES:
         return False
     cleaned = symbol.upper()
-    # Ex.: FDUSDUSDT termina em USDT e começa com um estável -> redundante
     for suf in STABLE_SUFFIXES:
         if cleaned.endswith(suf):
             base = cleaned[:-len(suf)]
@@ -163,14 +171,49 @@ def _is_stable_pair(symbol: str) -> bool:
     return False
 
 # -----------------------------
+# Fallback local de fetch_top_symbols (se seu fetcher não tiver)
+# -----------------------------
+_FALLBACK_TOP = [
+    # Top 100-ish estático (você pode ajustar depois)
+    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","ADAUSDT","DOGEUSDT","TRXUSDT","AVAXUSDT",
+    "LINKUSDT","MATICUSDT","TONUSDT","SHIBUSDT","DOTUSDT","LTCUSDT","UNIUSDT","BCHUSDT","ETCUSDT",
+    "APTUSDT","IMXUSDT","FILUSDT","NEARUSDT","OPUSDT","XLMUSDT","HBARUSDT","INJUSDT","ARBUSDT",
+    "LDOUSDT","ATOMUSDT","STXUSDT","RNDRUSDT","MKRUSDT","SUIUSDT","ALGOUSDT","AAVEUSDT","EGLDUSDT",
+    "ICPUSDT","QNTUSDT","VETUSDT","GRTUSDT","PEPEUSDT","FTMUSDT","MANAUSDT","SANDUSDT","AXSUSDT",
+    "FLOWUSDT","THETAUSDT","XTZUSDT","CHZUSDT","RUNEUSDT","KAVAUSDT","ROSEUSDT","GMXUSDT","SEIUSDT",
+    "ARUSDT","TIAUSDT","TAOUSDT","PYTHUSDT","ENAUSDT","JTOUSDT","JUPUSDT","FETUSDT","AGIXUSDT",
+    "OCEANUSDT","WLDUSDT","OPUSDT","ORDIUSDT","STRKUSDT","BLURUSDT","APEUSDT","BONKUSDT","DYDXUSDT",
+    "COMPUSDT","1INCHUSDT","SFPUSDT","RAYUSDT","KSMUSDT","CFXUSDT","HNTUSDT","BALUSDT","CRVUSDT",
+    "FTTUSDT","ZECUSDT","DASHUSDT","GMTUSDT","STORJUSDT","EWTUSDT","SKLUSDT","ZILUSDT","ICXUSDT",
+    "HOTUSDT","WOOUSDT","CELOUSDT","IOTAUSDT","BATUSDT","SXPUSDT","GALAUSDT","RNDRUSDT","TAOUSDT"
+]
+
+def _get_universe() -> List[str]:
+    # 1) se SYMBOLS no env, usa essa lista
+    if SYMBOLS:
+        return [s.strip().upper() for s in SYMBOLS]
+
+    # 2) se seu fetcher tiver fetch_top_symbols, usa ele
+    if cg_fetch_top_symbols is not None:
+        try:
+            top = cg_fetch_top_symbols(TOP_SYMBOLS)
+            if isinstance(top, list) and top:
+                return [s.strip().upper() for s in top]
+        except Exception as e:
+            print(f"⚠️ fetch_top_symbols indisponível: {e}")
+
+    # 3) fallback estático embutido
+    print("ℹ️ Usando lista estática de pares (fallback).")
+    return _FALLBACK_TOP[:TOP_SYMBOLS]
+
+# -----------------------------
 # Coleta OHLC com fallback
 # -----------------------------
 def _fetch_any_ohlc(symbol: str, days: int) -> List:
     """
-    Tenta provedores na ordem:
+    Ordem:
       1) CoinGecko
-      2) CryptoCompare (se disponível)
-    Retorna lista de candles no formato do fetcher (mantemos como veio).
+      2) CryptoCompare (se existir)
     """
     # 1) CoinGecko
     try:
@@ -180,7 +223,7 @@ def _fetch_any_ohlc(symbol: str, days: int) -> List:
     except Exception as e:
         print(f"⚠️ CoinGecko falhou {symbol}: {e}")
 
-    # 2) CryptoCompare (se implementado no projeto)
+    # 2) CryptoCompare
     if cc_fetch_ohlc is not None:
         try:
             rows = cc_fetch_ohlc(symbol, days)
@@ -199,11 +242,7 @@ def run_pipeline():
     print(f"NEWS ativo?: {USE_NEWS} | IA ativa?: {USE_AI} | Historico ativado?: True | Twitter ativo?: {USE_TWITTER}")
     print(f"Modelo disponível?: {has_model()} | Treino habilitado?: {TRAINING_ENABLED}")
 
-    # Universo
-    if SYMBOLS:
-        universe = SYMBOLS[:]
-    else:
-        universe = fetch_top_symbols(TOP_SYMBOLS)
+    universe = _get_universe()
 
     # Remoção opcional de pares estáveis redundantes
     if REMOVE_STABLES:
@@ -262,8 +301,7 @@ def run_pipeline():
         ai_prob = None
         if USE_AI and has_model():
             try:
-                # feature mínima; ajuste conforme seu trainer
-                feats = {"score_tech": float(score_tech)}
+                feats = {"score_tech": float(score_tech)}  # exemplo simples
                 ai_prob = predict_proba(feats)  # 0..1
             except Exception:
                 ai_prob = None
