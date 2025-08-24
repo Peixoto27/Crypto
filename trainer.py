@@ -16,6 +16,9 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.dummy import DummyClassifier
 import joblib
 
+# novo utilitário para salvar modelo + metadados de forma atômica
+from model_manager import save_model
+
 warnings.filterwarnings("ignore")
 
 # =========================
@@ -107,7 +110,6 @@ def candles_to_df(symbol: str, candles: List[Dict[str, Any]]) -> pd.DataFrame:
         df = df.sort_values("ts").reset_index(drop=True)
     return df
 
-
 def add_tech_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -166,7 +168,6 @@ def get_feature_columns(df: pd.DataFrame) -> List[str]:
         "volume"
     ]
     return [c for c in base_cols if c in df.columns]
-
 
 def train_model(X: pd.DataFrame, y: pd.Series):
     """
@@ -297,6 +298,77 @@ def bootstrap_if_needed(df: pd.DataFrame, min_rows: int) -> pd.DataFrame:
     boot = pd.concat(out, ignore_index=True)
     return boot.sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
 
+# -------------------------
+# Time-series CV utilities
+# -------------------------
+def time_series_cv_splits(dates: pd.Series, n_splits: int = 5, train_size: int = None, test_size: int = None, gap: int = 0) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Generate rolling time-series train/test index splits.
+
+    Args:
+        dates: pd.Series-like of timestamps (must be aligned with X index and sorted ascending).
+        n_splits: number of folds.
+        train_size: number of samples in initial training window (if None, uses 50% of data).
+        test_size: size of each test window (if None, divides remaining by n_splits).
+        gap: gap between train end and test start to avoid leakage (in samples).
+
+    Returns:
+        list of (train_idx, test_idx) tuples with numpy arrays of indices.
+    """
+    if train_size is None:
+        train_size = int(len(dates) * 0.5)
+    remaining = len(dates) - train_size
+    if remaining <= 0:
+        return []
+    if test_size is None:
+        test_size = max(1, remaining // n_splits)
+
+    splits = []
+    for i in range(n_splits):
+        train_end = train_size + i * test_size
+        test_start = train_end + gap
+        test_end = test_start + test_size
+        if test_end > len(dates):
+            break
+        train_idx = np.arange(0, train_end)
+        test_idx = np.arange(test_start, test_end)
+        splits.append((train_idx, test_idx))
+    return splits
+
+def evaluate_time_series_cv(X: pd.DataFrame, y: pd.Series, dates: pd.Series, n_splits: int = 5) -> Dict[str, Any]:
+    """Evaluate model performance using rolling time-series CV. Returns per-fold AUCs and mean.
+    """
+    res = {"folds": [], "mean_auc": None}
+    splits = time_series_cv_splits(dates, n_splits=n_splits)
+    if not splits:
+        return res
+
+    aucs = []
+    for fold_idx, (train_idx, test_idx) in enumerate(splits):
+        try:
+            Xtr = X.iloc[train_idx]
+            ytr = y.iloc[train_idx]
+            Xte = X.iloc[test_idx]
+            yte = y.iloc[test_idx]
+            model = train_model(Xtr, ytr)
+            proba = getattr(model, "predict_proba")(Xte)[:, 1]
+            # only compute AUC if both classes present
+            if len(np.unique(yte)) < 2:
+                auc = None
+            else:
+                auc = float(roc_auc_score(yte, proba))
+            aucs.append(auc)
+            res["folds"].append({"fold": fold_idx, "auc": auc, "train_samples": len(Xtr), "test_samples": len(Xte)})
+        except Exception as e:
+            res["folds"].append({"fold": fold_idx, "auc": None, "error": str(e)})
+
+    valid = [a for a in aucs if a is not None]
+    res["mean_auc"] = float(np.mean(valid)) if valid else None
+    return res
+
+
+# =========================
+# Main
+# =========================
 def main():
     log("🔧 Iniciando treino de IA…")
 
@@ -352,7 +424,20 @@ def main():
     X = feat_df[feat_cols].copy()
     y = feat_df["target"].astype(int).copy()
 
-    # 3) Split rápido p/ métrica e treino
+    # 3) Validação temporal (se tivermos ts)
+    try:
+        if "ts" in feat_df.columns and len(feat_df) >= 100:
+            cv_res = evaluate_time_series_cv(X, y, feat_df["ts"], n_splits=5)
+            if cv_res.get("mean_auc") is not None:
+                log(f"📈 Time-series CV mean AUC={cv_res['mean_auc']:.3f} | folds={len(cv_res['folds'])}")
+                for f in cv_res["folds"]:
+                    log(f" - fold {f.get('fold')}: auc={f.get('auc')}")
+            else:
+                log("📈 Time-series CV disponível, mas sem AUCs válidas (talvez classes monótonas nas folds).")
+    except Exception as e:
+        log(f"⚠️ Falha na validação temporal: {e}")
+
+    # 4) Split rápido p/ métrica e treino
     try:
         Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y)
     except Exception:
@@ -360,7 +445,7 @@ def main():
 
     model = train_model(Xtr, ytr)
 
-    # 4) Métrica opcional
+    # 5) Métrica opcional
     try:
         proba = getattr(model, "predict_proba")(Xte)[:, 1]
         auc = roc_auc_score(yte, proba)
@@ -368,19 +453,28 @@ def main():
     except Exception:
         log(f"✅ Treino concluído (sem AUC) | amostras={len(X)} | features={len(feat_cols)}")
 
-    # 5) Salvar wrapper
+    # 6) Salvar wrapper usando model_manager (com fallback seguro)
     wrapper = AIPredictor(model, feat_cols)
-    joblib.dump(wrapper, MODEL_FILE)
-    log(f"💾 Modelo salvo em {MODEL_FILE} (columns={feat_cols})")
 
-    # salva metadados (lista de features) ao lado do modelo para uso em produção
-    try:
-        meta_path = os.path.splitext(MODEL_FILE)[0] + "_meta.json"
-        with open(meta_path, "w", encoding="utf-8") as mf:
-            json.dump({"features": feat_cols}, mf, ensure_ascii=False, indent=2)
-        log(f"💾 Metadados salvos em {meta_path}")
-    except Exception as e:
-        log(f"⚠️ Falha ao salvar metadados: {e}")
+    meta = {
+        "features": feat_cols,
+        "training_samples": len(X),
+        "random_state": RANDOM_STATE,
+    }
+    ok = save_model(wrapper, MODEL_FILE, meta=meta)
+    if ok:
+        log(f"💾 Modelo e metadados salvos em {MODEL_FILE}")
+    else:
+        # fallback to previous behavior
+        joblib.dump(wrapper, MODEL_FILE)
+        log(f"💾 Modelo salvo em {MODEL_FILE} (fallback)")
+        try:
+            meta_path = os.path.splitext(MODEL_FILE)[0] + "_meta.json"
+            with open(meta_path, "w", encoding="utf-8") as mf:
+                json.dump({"features": feat_cols}, mf, ensure_ascii=False, indent=2)
+            log(f"💾 Metadados salvos em {meta_path} (fallback)")
+        except Exception as e:
+            log(f"⚠️ Falha ao salvar metadados em fallback: {e}")
 
 
 if __name__ == "__main__":
