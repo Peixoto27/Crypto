@@ -1,146 +1,93 @@
-# -*- coding: utf-8 -*-
-"""
-model_manager.py — utilitário para carregar/salvar modelo e prever com segurança.
-
-- Lê/salva o caminho de modelo de MODEL_FILE (env; default: model.pkl)
-- Lê metadados em MODEL_FILE_meta.json (lista de features usadas no treino)
-- Expõe: load_model(), predict_proba(features_dict), has_model()
-"""
-
 import os
 import json
-from typing import Dict, Optional, Tuple, Any
-import numpy as np
+import time
+from datetime import datetime
+from typing import Any, Dict
 
-from joblib import load, dump
+import joblib
 
-MODEL_FILE = os.getenv("MODEL_FILE", "model.pkl")
-
-def _meta_path() -> str:
-    base, _ = os.path.splitext(MODEL_FILE)
-    return base + "_meta.json"
-
-_cached: Tuple[Optional[object], Optional[dict]] = (None, None)
-# (_model, _meta)
-
-def has_model() -> bool:
-    # considera presença do arquivo do modelo; meta é opcional
-    return os.path.exists(MODEL_FILE)
-
-def _extract_meta_from_obj(obj: Any) -> Optional[dict]:
-    """
-    Tenta extrair um dicionário de metadados (com chave "features") de
-    várias estruturas de objeto que podem ser salvas no repositório.
-    """
-    # caso obj seja dict salvo como {"model": ..., "meta": {...}} ou {"model":..., "features": [...]}
-    if isinstance(obj, dict):
-        if "meta" in obj and isinstance(obj["meta"], dict):
-            return obj["meta"]
-        if "features" in obj:
-            return {"features": obj["features"]}
-
-    # wrappers/objetos que possam ter atributos com nomes comuns
-    for attr in ("meta", "features", "feat_cols", "feature_names", "columns"):
-        try:
-            if hasattr(obj, attr):
-                val = getattr(obj, attr)
-                if isinstance(val, (list, tuple)):
-                    return {"features": list(val)}
-                if isinstance(val, dict) and "features" in val:
-                    return val
-        except Exception:
-            # evitar falha ao inspecionar objetos inesperados
-            continue
-
-    return None
-
-def load_model(force: bool = False) -> Tuple[Optional[object], Optional[dict]]:
-    """Carrega modelo + metadados. Cacheado em memória."""
-    global _cached
-    if not force and _cached[0] is not None and _cached[1] is not None:
-        return _cached
-
-    if not has_model():
-        _cached = (None, None)
-        return _cached
-
+# gather lightweight package versions without forcing imports
+def _get_version(pkg: str):
     try:
-        loaded = load(MODEL_FILE)
+        # Python 3.8+ importlib.metadata
+        from importlib import metadata
+        return metadata.version(pkg)
     except Exception:
-        _cached = (None, None)
-        return _cached
-
-    mdl = None
-    meta = None
-
-    # Caso comum: joblib.dump({"model": model, "meta": {...}}, MODEL_FILE)
-    if isinstance(loaded, dict) and "model" in loaded:
-        mdl = loaded.get("model")
-        meta = loaded.get("meta") or ({"features": loaded.get("features")} if "features" in loaded else None)
-    else:
-        # caso carregado seja o próprio estimador / pipeline / wrapper
-        mdl = loaded
-        # primeiro: tentar ler arquivo de meta separado
         try:
-            if os.path.exists(_meta_path()):
-                with open(_meta_path(), "r", encoding="utf-8") as f:
-                    meta = json.load(f)
+            import pkg_resources
+            return pkg_resources.get_distribution(pkg).version
         except Exception:
-            meta = None
+            return None
 
-        # se não houver meta em arquivo, tentar extrair do objeto carregado
-        if meta is None:
-            try:
-                meta = _extract_meta_from_obj(mdl)
-            except Exception:
-                meta = None
 
-    _cached = (mdl, meta)
-    return _cached
+def save_model(obj: Any, model_path: str, meta: Dict[str, Any] = None) -> bool:
+    """Save a model atomically and write metadata alongside it.
 
-def save_model(model, meta: dict) -> bool:
-    """Salvar modelo + metadados (opcionalmente usado pelo trainer)."""
+    Args:
+        obj: Python object to persist (e.g. joblib-serializable estimator or wrapper).
+        model_path: target path for the model (e.g. model.pkl).
+        meta: optional dict with metadata to be merged into the saved metadata file.
+
+    Returns:
+        True on success, False on failure.
+    """
+    meta = meta.copy() if isinstance(meta, dict) else {}
+    # enrich metadata
+    meta.setdefault("saved_at", datetime.utcnow().isoformat() + "Z")
     try:
-        dump(model, MODEL_FILE)
-        # salva metadados se fornecido
+        meta.setdefault("model_class", type(obj).__name__)
+    except Exception:
+        meta.setdefault("model_class", str(type(obj)))
+
+    # capture commonly useful package versions (best effort)
+    packages = [
+        "python", "numpy", "pandas", "scikit-learn", "joblib",
+        "lightgbm", "xgboost"
+    ]
+    versions = {}
+    for p in packages:
+        if p == "python":
+            import sys
+
+            versions[p] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        else:
+            v = _get_version(p)
+            if v:
+                versions[p] = v
+    if versions:
+        meta.setdefault("package_versions", versions)
+
+    # if repo commit is available in env, add it
+    commit = os.getenv("GIT_COMMIT") or os.getenv("CI_COMMIT_SHA") or os.getenv("COMMIT_SHA")
+    if commit:
+        meta.setdefault("git_commit", commit)
+
+    # atomic write pattern
+    model_dir = os.path.dirname(os.path.abspath(model_path)) or "."
+    os.makedirs(model_dir, exist_ok=True)
+    tmp_model = model_path + ".tmp"
+    try:
+        # dump model to temporary file
+        joblib.dump(obj, tmp_model)
+        # replace atomically
+        os.replace(tmp_model, model_path)
+    except Exception as e:
+        # cleanup tmp if any
         try:
-            with open(_meta_path(), "w", encoding="utf-8") as f:
-                json.dump(meta or {}, f, ensure_ascii=False, indent=2)
+            if os.path.exists(tmp_model):
+                os.remove(tmp_model)
         except Exception:
-            # não falhar se não conseguir salvar meta
             pass
-        # invalida cache e recarrega
-        load_model(force=True)
-        return True
-    except Exception:
         return False
 
-def predict_proba(features: Dict[str, float]) -> Optional[float]:
-    """Recebe um dicionário de features, alinha às features do treino,
-    preenche ausentes com 0.0 e retorna probabilidade da classe positiva (0..1)."""
-    mdl, meta = load_model()
-    if mdl is None:
-        return None
-
-    feats = None
-    if meta and isinstance(meta, dict):
-        feats = meta.get("features")
-
-    # se ainda não temos features, tentar extrair do modelo carregado (última tentativa)
-    if not feats:
-        extracted = _extract_meta_from_obj(mdl)
-        if extracted:
-            feats = extracted.get("features")
-
-    if not feats:
-        # sem lista de features não conseguimos alinhar o dicionário -> retorna None
-        return None
-
-    row = [float(features.get(k, 0.0)) for k in feats]
+    # write metadata file next to model
     try:
-        proba = mdl.predict_proba(np.array([row]))[:, 1][0]
-        # robustez numérica
-        proba = max(0.0, min(1.0, float(proba)))
-        return proba
+        meta_path = os.path.splitext(model_path)[0] + "_meta.json"
+        with open(meta_path + ".tmp", "w", encoding="utf-8") as mf:
+            json.dump(meta, mf, ensure_ascii=False, indent=2)
+        os.replace(meta_path + ".tmp", meta_path)
     except Exception:
-        return None
+        # metadata failure should not break the saved model
+        return True
+
+    return True
