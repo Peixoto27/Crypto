@@ -297,7 +297,6 @@ def bootstrap_if_needed(df: pd.DataFrame, min_rows: int) -> pd.DataFrame:
     boot = pd.concat(out, ignore_index=True)
     return boot.sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
 
-
 def main():
     log("🔧 Iniciando treino de IA…")
 
@@ -373,6 +372,15 @@ def main():
     wrapper = AIPredictor(model, feat_cols)
     joblib.dump(wrapper, MODEL_FILE)
     log(f"💾 Modelo salvo em {MODEL_FILE} (columns={feat_cols})")
+
+    # salva metadados (lista de features) ao lado do modelo para uso em produção
+    try:
+        meta_path = os.path.splitext(MODEL_FILE)[0] + "_meta.json"
+        with open(meta_path, "w", encoding="utf-8") as mf:
+            json.dump({"features": feat_cols}, mf, ensure_ascii=False, indent=2)
+        log(f"💾 Metadados salvos em {meta_path}")
+    except Exception as e:
+        log(f"⚠️ Falha ao salvar metadados: {e}")
 
 
 if __name__ == "__main__":
