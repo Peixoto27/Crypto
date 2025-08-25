@@ -1,79 +1,76 @@
-# -*- coding: utf-8 -*-
+# config.py
 import os
 
-def _bool(name: str, default: str = "false"):
-    return os.getenv(name, default).strip().lower() in ("1","true","yes","on")
+# =========================
+# Funções auxiliares
+# =========================
+def _as_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y", "on")
 
-def _float(name: str, default: str):
-    try: return float(os.getenv(name, default))
-    except: return float(default)
+def _as_int(name: str, default: str) -> int:
+    return int(os.getenv(name, default).strip())
 
-def _int(name: str, default: str):
-    try: return int(float(os.getenv(name, default)))
-    except: return int(float(default))
+def _as_float(name: str, default: str) -> float:
+    return float(os.getenv(name, default).strip())
 
-# ---------- Núcleo ----------
-MIN_CONFIDENCE      = _float("MIN_CONFIDENCE", "0.50")
-DEBUG_SCORE         = _bool("DEBUG_SCORE", "true")
+# =========================
+# Intervalo / Execução
+# =========================
+INTERVAL_MIN        = _as_int("INTERVAL_MIN", "20")      # minutos entre ciclos
+LOOKBACK_HOURS      = _as_int("LABEL_LOOKBACK_HOURS", "24")
 
-TOP_SYMBOLS         = _int("TOP_SYMBOLS", "20")
-SYMBOLS             = [s.strip() for s in os.getenv("SYMBOLS",
-                        "BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,SOLUSDT,MATICUSDT,DOTUSDT,LTCUSDT,LINKUSDT"
-                      ).split(",") if s.strip()]
+# =========================
+# Flags de uso de fontes / features
+# =========================
+NEWS_USE            = _as_bool("NEWS_USE", "true")
+TWITTER_USE         = _as_bool("TWITTER_USE", "true")
+USE_AI              = _as_bool("USE_AI", "true")
+TRAINING_ENABLED    = _as_bool("TRAINING_ENABLED", "true")
+SAVE_HISTORY        = _as_bool("SAVE_HISTORY", "true")
+SEND_STATUS_UPDATES = _as_bool("SEND_STATUS_UPDATES", "true")
 
-# ---------- CoinGecko ----------
-API_DELAY_BULK      = _float("API_DELAY_BULK", "2.5")
-API_DELAY_OHLC      = _float("API_DELAY_OHLC", "12.0")
-MAX_RETRIES         = _int("MAX_RETRIES", "6")
-BACKOFF_BASE        = _float("BACKOFF_BASE", "2.5")
-OHLC_DAYS           = _int("OHLC_DAYS", "14")
-MIN_BARS            = _int("MIN_BARS", "40")
-BATCH_OHLC          = _int("BATCH_OHLC", "8")
-BATCH_PAUSE_SEC     = _int("BATCH_PAUSE_SEC", "60")
+# =========================
+# Arquivos e diretórios
+# (mantemos tudo organizado em /data e /model)
+# =========================
+DATA_DIR            = os.getenv("DATA_DIR", "data")
+HISTORY_DIR         = os.getenv("HISTORY_DIR", f"{DATA_DIR}/history")
+DATA_RAW_FILE       = os.getenv("DATA_RAW_FILE", f"{DATA_DIR}/data_raw.json")
+SIGNALS_FILE        = os.getenv("SIGNALS_FILE", f"{DATA_DIR}/signals.json")
+HISTORY_FILE        = os.getenv("HISTORY_FILE", f"{DATA_DIR}/history.json")
+POSITIONS_FILE      = os.getenv("POSITIONS_FILE", f"{DATA_DIR}/positions.json")
 
-# ---------- Fonte de dados (coingecko | ccxt) ----------
-DATA_SOURCE         = os.getenv("DATA_SOURCE", "coingecko").lower()
-CCXT_RATE_LIMIT_MS  = _int("CCXT_RATE_LIMIT_MS", "1200")
+MODEL_DIR           = os.getenv("MODEL_DIR", "model")
+MODEL_FILE          = os.getenv("MODEL_FILE", f"{MODEL_DIR}/model.pkl")
 
-# ---------- Arquivos ----------
-DATA_RAW_FILE       = os.getenv("DATA_RAW_FILE", "data_raw.json")
-SIGNALS_FILE        = os.getenv("SIGNALS_FILE", "data/signals.json")
-HISTORY_FILE        = os.getenv("HISTORY_FILE", "history.json")
-MODEL_FILE          = os.getenv("MODEL_FILE", "model.pkl")
-POSITIONS_FILE      = os.getenv("POSITIONS_FILE", "positions.json")
+CURSOR_FILE         = os.getenv("CURSOR_FILE", f"{DATA_DIR}/scan_state.json")
 
-# ---------- Anti-duplicados ----------
-COOLDOWN_HOURS         = _float("COOLDOWN_HOURS", "6")
-CHANGE_THRESHOLD_PCT   = _float("CHANGE_THRESHOLD_PCT", "1.0")
-SEND_STATUS_UPDATES    = _bool("SEND_STATUS_UPDATES", "true")
+# =========================
+# Treinamento
+# =========================
+TRAIN_MIN_SAMPLES   = _as_int("TRAIN_MIN_SAMPLES", "200")
+RANDOM_STATE        = _as_int("RANDOM_STATE", "42")
+AI_THRESHOLD        = _as_float("AI_THRESHOLD", "0.70")
 
-# ---------- IA ----------
-TRAINING_ENABLED    = _bool("TRAINING_ENABLED", "true")
-USE_AI              = _bool("USE_AI", "true")
-AI_THRESHOLD        = _float("AI_THRESHOLD", "0.55")
+# =========================
+# Telegram (opcional)
+# =========================
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ---------- Indicadores extras ----------
-USE_TECH_EXTRA      = _bool("USE_TECH_EXTRA", "true")      # Ichimoku/SAR/Stochastic
-USE_VOLUME_INDICATORS = _bool("USE_VOLUME_INDICATORS", "false")  # VWAP/OBV (precisa de volume)
-TECH_W_ICHI         = _float("TECH_W_ICHI", "0.25")
-TECH_W_SAR          = _float("TECH_W_SAR", "0.20")
-TECH_W_STOCH        = _float("TECH_W_STOCH", "0.20")
-TECH_W_VWAP         = _float("TECH_W_VWAP", "0.20")
-TECH_W_OBV          = _float("TECH_W_OBV", "0.15")
+# =========================
+# Outras configs úteis para logs/indicadores
+# =========================
+TECH_MIN_THRESHOLD  = _as_float("TECH_MIN_THRESHOLD", "0.45")   # ex.: 45% mínimo para enviar
+MAX_SYMBOLS_PER_CYCLE = _as_int("MAX_SYMBOLS_PER_CYCLE", "30")
 
-# ---------- Notícias / Sentimento ----------
-USE_NEWS            = _bool("USE_NEWS", "false")  # fica OFF até você ligar
-THENEWSAPI_KEY      = os.getenv("THENEWSAPI_KEY", "")
-NEWS_WEIGHT         = _float("NEWS_WEIGHT", "0.20")
-NEWS_MAX_BOOST      = _float("NEWS_MAX_BOOST", "0.15")
-NEWS_MAX_PEN        = _float("NEWS_MAX_PEN", "0.25")
-NEWS_VETO_NEG       = _float("NEWS_VETO_NEG", "-0.60")
-NEWS_CACHE_FILE     = os.getenv("NEWS_CACHE_FILE", "news_cache.json")
-NEWS_CACHE_TTL_SEC  = _int("NEWS_CACHE_TTL_SEC", "3600")
-
-# ---------- Telegram ----------
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# ---------- Logs ----------
-LOG_LEVEL           = os.getenv("LOG_LEVEL", "INFO")
+# =========================
+# Garantia de diretórios
+# =========================
+def ensure_dirs():
+    for d in (DATA_DIR, HISTORY_DIR, MODEL_DIR):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            # não deixa o processo quebrar por falta de permissão; o main loga se necessário
+            pass
