@@ -80,7 +80,7 @@ CHANGE_THRESHOLD_PCT = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
 DATA_RAW_FILE      = os.getenv("DATA_RAW_FILE", "data_raw.json")
 HISTORY_DIR        = os.getenv("HISTORY_DIR", "data/history")
 CURSOR_FILE        = os.getenv("CURSOR_FILE", "scan_state.json")
-SIGNALS_FILE       = os.getenv("SIGNALS_FILE", "signals.json")
+SIGNALS_FILE       = os.getenv("SIGNALS_FILE", "data/signals.json")
 
 USE_AI             = _as_bool("USE_AI", "true")
 TRAINING_ENABLED   = _as_bool("TRAINING_ENABLED", "true")
