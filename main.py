@@ -1,140 +1,344 @@
-# main.py
-import os
-import time
-import logging
+# -*- coding: utf-8 -*-
+"""
+main.py — pipeline robusto
+- Universo: SYMBOLS do env; se vazio tenta fetch_top_symbols; senão fallback estático
+- Rotaciona lotes (scan_state.json)
+- Coleta OHLC (CoinGecko e opcional CryptoCompare), normaliza -> [{t,o,h,l,c}]
+- Filtra dados ruins, exige MIN_BARS
+- Calcula score técnico e mistura com IA (se houver modelo)
+- Gera sinal, deduplica e notifica (Telegram), salva signals.json
+- Salva cache OHLC por símbolo e data_raw.json
+"""
 
-from config import (
-    # diretórios/arquivos
-    DATA_DIR, HISTORY_DIR, DATA_RAW_FILE, SIGNALS_FILE, HISTORY_FILE,
-    MODEL_DIR, MODEL_FILE, POSITIONS_FILE, CURSOR_FILE,
-    # flags
-    NEWS_USE, TWITTER_USE, USE_AI, TRAINING_ENABLED, SAVE_HISTORY, SEND_STATUS_UPDATES,
-    # números
-    INTERVAL_MIN, AI_THRESHOLD, TRAIN_MIN_SAMPLES,
-    # helpers
-    ensure_dirs,
-)
+import os, json, math, time
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 
-# ---- módulos internos (ajuste os nomes para os seus arquivos) ----
-# Estes nomes seguem o que você me mandou/mostrou nos prints:
-from utils import save_json                         # já corrige path/dir e salva JSON
-from data_collector import collect_all              # coleta OHLC/preços/notícias/tweets (se aplicável)
-from analyzer import analyze_signals                # calcula indicadores e score técnico
-from ai_predictor import load_model, predict_with_ai
-from history_manager import append_cycle_to_history # salva histórico por ciclo
-from result_resolver_notify import resolve_and_notify  # notifica (texto + imagem) e atualiza status
+# ---------- Fetchers ----------
+from data_fetcher_coingecko import fetch_ohlc as cg_fetch_ohlc
+try:
+    from data_fetcher_coingecko import fetch_top_symbols as cg_fetch_top_symbols
+except Exception:
+    cg_fetch_top_symbols = None
+try:
+    from data_fetcher_cryptocompare import fetch_ohlc_cc as cc_fetch_ohlc  # opcional
+except Exception:
+    cc_fetch_ohlc = None
 
-# treino
-from trainer import train_and_save                  # função de treino + persistência do modelo
+# ---------- Estratégia / Persistência ----------
+from apply_strategies import score_signal, generate_signal
+from notifier_telegram import send_signal_notification
+from positions_manager import should_send_and_register
+from signal_generator import append_signal
+from history_manager import save_ohlc_cache  # save_ohlc_cache(dir, symbol, rows)
 
-# ---------------------------------------------------------------
+# ---------- IA (opcional) ----------
+try:
+    from model_manager import predict_proba, has_model
+except Exception:
+    def predict_proba(_: Dict[str, float]) -> Optional[float]:
+        return None
+    def has_model() -> bool:
+        return False
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+# ---------- Config (via env) ----------
+def _as_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1","true","yes","y","on")
 
-def _model_available() -> bool:
-    return os.path.exists(MODEL_FILE) and os.path.getsize(MODEL_FILE) > 0
+RUN_INTERVAL_MIN   = os.getenv("RUN_INTERVAL_MIN", "20")
 
-def _log_header():
-    logging.info("🚀 Runner iniciado. Intervalo = %.1f min.", float(INTERVAL_MIN))
-    logging.info(
-        "NEWS ativo?: %s | IA ativa?: %s | Historico ativado?: %s | Twitter ativo?: %s",
-        NEWS_USE, USE_AI, SAVE_HISTORY, TWITTER_USE
-    )
-    logging.info(
-        "Modelo disponível?: %s | Treino habilitado?: %s",
-        _model_available(), TRAINING_ENABLED
-    )
+SYMBOLS            = [s for s in os.getenv("SYMBOLS", "").replace(" ", "").split(",") if s]
+TOP_SYMBOLS        = int(os.getenv("TOP_SYMBOLS", "100"))
+SELECT_PER_CYCLE   = int(os.getenv("SELECT_PER_CYCLE", "8"))
 
-def _try_autotrain(history_items: list):
-    """
-    Se TREINING_ENABLED=True e houver amostras suficientes,
-    treina e salva o modelo em MODEL_FILE.
-    """
-    if not TRAINING_ENABLED:
-        return
+DAYS_OHLC          = int(os.getenv("DAYS_OHLC", "30"))
+MIN_BARS           = int(os.getenv("MIN_BARS", "180"))
 
-    n_samples = len(history_items or [])
-    if n_samples < TRAIN_MIN_SAMPLES:
-        logging.info("📉 Amostras rotuladas ainda insuficientes para treino (%d < %d).",
-                     n_samples, TRAIN_MIN_SAMPLES)
-        return
+SCORE_THRESHOLD    = float(os.getenv("SCORE_THRESHOLD", "0.45"))
+MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "0.45"))
 
+WEIGHT_TECH        = float(os.getenv("WEIGHT_TECH", "1.5"))
+WEIGHT_AI          = float(os.getenv("WEIGHT_AI", "1.0"))
+
+COOLDOWN_HOURS       = float(os.getenv("COOLDOWN_HOURS", "6"))
+CHANGE_THRESHOLD_PCT = float(os.getenv("CHANGE_THRESHOLD_PCT", "1.0"))
+
+DATA_RAW_FILE      = os.getenv("DATA_RAW_FILE", "data_raw.json")
+HISTORY_DIR        = os.getenv("HISTORY_DIR", "data/history")
+CURSOR_FILE        = os.getenv("CURSOR_FILE", "scan_state.json")
+SIGNALS_FILE       = os.getenv("SIGNALS_FILE", "data/signals.json")
+
+USE_AI             = _as_bool("USE_AI", "true")
+TRAINING_ENABLED   = _as_bool("TRAINING_ENABLED", "true")
+USE_NEWS           = _as_bool("USE_RSS_NEW", "false") or _as_bool("USE_THENEWSAPI", "false")
+USE_TWITTER        = _as_bool("USE_TWITTER", "false")
+
+REMOVE_STABLES     = _as_bool("REMOVE_STABLES", "true")
+STABLE_SUFFIXES    = ("USDT","FDUSD","USDC","BUSD","TUSD")
+
+# ---------- Util ----------
+def _ts() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def _ensure_cursor() -> Dict[str, Any]:
     try:
-        logging.info("🧪 Iniciando treino automático (amostras=%d)…", n_samples)
-        model = train_and_save(history_items, MODEL_FILE)
-        if model:
-            logging.info("✅ Modelo treinado e salvo em %s", MODEL_FILE)
+        with open(CURSOR_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"offset": 0, "cycle": 0}
+
+def _save_cursor(st: Dict[str, Any]) -> None:
+    with open(CURSOR_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+
+def _rotate(symbols: List[str], take: int) -> List[str]:
+    if take <= 0 or not symbols:
+        return symbols
+    st = _ensure_cursor()
+    off = int(st.get("offset", 0)) % len(symbols)
+    batch = [symbols[(off + i) % len(symbols)] for i in range(min(take, len(symbols)))]
+    st["offset"] = (off + take) % len(symbols)
+    st["cycle"] = int(st.get("cycle", 0)) + 1
+    _save_cursor(st)
+    return batch
+
+def _is_stable_pair(symbol: str) -> bool:
+    if not REMOVE_STABLES:
+        return False
+    s = symbol.upper()
+    for suf in STABLE_SUFFIXES:
+        if s.endswith(suf):
+            base = s[:-len(suf)]
+            for s2 in STABLE_SUFFIXES:
+                if base.endswith(s2):
+                    return True
+    return False
+
+# ---------- Universo ----------
+_FALLBACK_TOP = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","ADAUSDT","DOGEUSDT","TRXUSDT",
+    "AVAXUSDT","LINKUSDT","MATICUSDT","TONUSDT","SHIBUSDT","DOTUSDT","LTCUSDT","UNIUSDT",
+    "BCHUSDT","ETCUSDT","APTUSDT","IMXUSDT","FILUSDT","NEARUSDT","OPUSDT","XLMUSDT",
+    "HBARUSDT","INJUSDT","ARBUSDT","LDOUSDT","ATOMUSDT","STXUSDT","RNDRUSDT","MKRUSDT",
+    "SUIUSDT","ALGOUSDT","AAVEUSDT","ICPUSDT","QNTUSDT","VETUSDT","GRTUSDT","PEPEUSDT",
+    "FTMUSDT","MANAUSDT","SANDUSDT","AXSUSDT","FLOWUSDT","THETAUSDT","XTZUSDT","CHZUSDT",
+    "RUNEUSDT","KAVAUSDT","ROSEUSDT","GMXUSDT","SEIUSDT","ARUSDT","TIAUSDT","TAOUSDT",
+    "PYTHUSDT","ENAUSDT","JTOUSDT","JUPUSDT","FETUSDT","AGIXUSDT","OCEANUSDT","WLDUSDT",
+    "ORDIUSDT","STRKUSDT","BLURUSDT","APEUSDT","BONKUSDT","DYDXUSDT","COMPUSDT","1INCHUSDT",
+    "SFPUSDT","RAYUSDT","KSMUSDT","CFXUSDT","HNTUSDT","BALUSDT","CRVUSDT","ZECUSDT",
+    "DASHUSDT","GMTUSDT","STORJUSDT","EWTUSDT","SKLUSDT","ZILUSDT","ICXUSDT","HOTUSDT",
+    "WOOUSDT","CELOUSDT","IOTAUSDT","BATUSDT","SXPUSDT","GALAUSDT"
+]
+
+def _get_universe() -> List[str]:
+    if SYMBOLS:
+        return [s.strip().upper() for s in SYMBOLS]
+    if cg_fetch_top_symbols is not None:
+        try:
+            top = cg_fetch_top_symbols(TOP_SYMBOLS)
+            if isinstance(top, list) and top:
+                return [s.strip().upper() for s in top]
+        except Exception as e:
+            print(f"⚠️ fetch_top_symbols indisponível: {e}")
+    print("ℹ️ Usando lista estática de pares (fallback).")
+    return _FALLBACK_TOP[:TOP_SYMBOLS]
+
+# ---------- OHLC ----------
+def _fetch_any_ohlc(symbol: str, days: int) -> List:
+    # 1) CoinGecko
+    try:
+        rows = cg_fetch_ohlc(symbol, days)
+        if rows:
+            return rows
+    except Exception as e:
+        print(f"⚠️ CoinGecko falhou {symbol}: {e}")
+    # 2) CryptoCompare (opcional)
+    if cc_fetch_ohlc is not None:
+        try:
+            rows = cc_fetch_ohlc(symbol, days)
+            if rows:
+                return rows
+        except Exception as e:
+            print(f"⚠️ CryptoCompare falhou {symbol}: {e}")
+    return []
+
+def _norm_ohlc(rows: List) -> List[Dict[str, float]]:
+    out: List[Dict[str,float]] = []
+    if not rows:
+        return out
+    if isinstance(rows, list) and rows and isinstance(rows[0], list):
+        for r in rows:
+            if len(r) >= 5 and None not in (r[0],r[1],r[2],r[3],r[4]):
+                out.append({"t": float(r[0]), "o": float(r[1]), "h": float(r[2]),
+                            "l": float(r[3]), "c": float(r[4])})
+    elif isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        for r in rows:
+            try:
+                t = float(r.get("t", r.get("time", r.get("timestamp", 0.0))))
+                o = float(r.get("o", r.get("open")))
+                h = float(r.get("h", r.get("high")))
+                l = float(r.get("l", r.get("low")))
+                c = float(r.get("c", r.get("close")))
+                if None in (t,o,h,l,c): 
+                    continue
+                out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
+            except Exception:
+                continue
+    clean: List[Dict[str,float]] = []
+    for b in out:
+        vals = [b["o"], b["h"], b["l"], b["c"]]
+        if any((v is None) or math.isnan(v) or math.isinf(v) for v in vals):
+            continue
+        if all(abs(v) < 1e-12 for v in vals):
+            continue
+        clean.append(b)
+    return clean
+
+# ---------- Scoring / Mix ----------
+def _safe_score(ohlc_norm: List[Dict[str,float]]) -> float:
+    try:
+        s = score_signal(ohlc_norm)
+        if isinstance(s, dict):
+            s = float(s.get("score", s.get("value", s.get("confidence", 0.0))))
+        elif isinstance(s, tuple):
+            s = float(s[0])
         else:
-            logging.warning("⚠️ train_and_save não retornou modelo (verificar trainer.py).")
+            s = float(s)
+        if s > 1.0:
+            s /= 100.0
+        return max(0.0, min(1.0, s))
     except Exception as e:
-        logging.exception("❌ Erro no treino automático: %s", e)
+        print(f"❌ score_signal falhou: {e}")
+        return 0.0
 
-def runner_once():
-    _log_header()
+def _mix_conf(score_tech: float, ai_prob: Optional[float]) -> float:
+    if WEIGHT_AI <= 0.0 or ai_prob is None:
+        return score_tech
+    tot = WEIGHT_TECH + WEIGHT_AI
+    return max(0.0, min(1.0, (WEIGHT_TECH*score_tech + WEIGHT_AI*ai_prob) / max(tot,1e-9)))
 
-    # Garante estrutura de pastas
+# ---------- Pipeline ----------
+def run_pipeline():
+    print(f"▶️ Runner iniciado. Intervalo = {RUN_INTERVAL_MIN} min.")
+    print(f"NEWS ativo?: {USE_NEWS} | IA ativa?: {USE_AI} | Historico ativado?: True | Twitter ativo?: {USE_TWITTER}")
+    print(f"Modelo disponível?: {has_model()} | Treino habilitado?: {TRAINING_ENABLED}")
+
+    universe = _get_universe()
+    if REMOVE_STABLES:
+        before = len(universe)
+        universe = [s for s in universe if not _is_stable_pair(s)]
+        if before - len(universe) > 0:
+            print(f"🧠 Removidos {before-len(universe)} pares estáveis redundantes.")
+
+    selected = _rotate(universe, SELECT_PER_CYCLE)
+    print(f"Moedas deste ciclo ({len(selected)}/{len(universe)}): {', '.join(selected)}")
+
+    collected: Dict[str, Any] = {}
+    ok_syms: List[str] = []
+
+    for sym in selected:
+        print(f"Coletando OHLC {sym} (tf={DAYS_OHLC}d)…")
+        try:
+            raw = _fetch_any_ohlc(sym, DAYS_OHLC)
+            norm = _norm_ohlc(raw)
+            n = len(norm)
+            if n < MIN_BARS:
+                print(f"  ⚠️ {sym}: OHLC insuficiente após normalização ({n}/{MIN_BARS})")
+                continue
+            collected[sym] = norm
+            ok_syms.append(sym)
+            print(f"  → OK | candles={n}")
+            if not save_ohlc_cache(HISTORY_DIR, sym, norm):
+                print(f"[HIST] falhou salvar cache {sym}")
+        except Exception as e:
+            print(f"⚠️ Erro OHLC {sym}: {e}")
+
+    if not ok_syms:
+        print("❌ Nenhum ativo com OHLC suficiente.")
+        return
+
     try:
-        ensure_dirs()
+        with open(DATA_RAW_FILE, "w", encoding="utf-8") as f:
+            json.dump({"symbols": ok_syms, "data": collected}, f, ensure_ascii=False)
+        print(f"💾 Salvo {DATA_RAW_FILE} ({len(ok_syms)} ativos)")
     except Exception as e:
-        logging.warning("Não foi possível garantir diretórios: %s", e)
+        print(f"⚠️ Falha ao salvar {DATA_RAW_FILE}: {e}")
 
-    # 1) Coleta
-    raw = collect_all(
-        use_news=NEWS_USE,
-        use_twitter=TWITTER_USE
-    )
-    save_json(DATA_RAW_FILE, raw)
-    logging.info("💾 Salvo %s", DATA_RAW_FILE)
+    saved = 0
+    for sym in ok_syms:
+        ohlc = collected[sym]
 
-    # 2) Análise técnica
-    signals = analyze_signals(raw, min_threshold=AI_THRESHOLD)
-    # signals é uma lista de dicts por símbolo
+        score_tech = _safe_score(ohlc)
+        ai_prob = None
+        if USE_AI and has_model():
+            try:
+                feats = {"score_tech": float(score_tech)}  # expanda depois com features
+                ai_prob = predict_proba(feats)
+            except Exception as e:
+                print(f"⚠️ IA indisponível: {e}")
+                ai_prob = None
 
-    # 3) IA (se habilitada e houver modelo)
-    if USE_AI and _model_available():
+        final_conf = _mix_conf(score_tech, ai_prob)
+
+        pct_tech = round(score_tech*100, 1)
+        pct_ai   = "-" if ai_prob is None else f"{round(ai_prob*100,1)}%"
+        pct_mix  = round(final_conf*100, 1)
+        print(f"[IND] {sym} | Técnico: {pct_tech}% | IA: {pct_ai} | Mix(T:{WEIGHT_TECH},A:{WEIGHT_AI}): {pct_mix}% (min {int(MIN_CONFIDENCE*100)}%)")
+
+        if score_tech < SCORE_THRESHOLD or final_conf < MIN_CONFIDENCE:
+            continue
+
         try:
-            load_model()  # carrega só uma vez no processo
-            signals = predict_with_ai(signals, MODEL_FILE, threshold=AI_THRESHOLD)
-            logging.info("🤖 IA aplicada sobre os sinais.")
+            sig = generate_signal(ohlc)
         except Exception as e:
-            logging.exception("Erro aplicando IA: %s", e)
-    else:
-        if USE_AI:
-            logging.info("⚠️ IA ativa mas o modelo ainda não está disponível (%s).", MODEL_FILE)
+            print(f"⚠️ {sym}: erro generate_signal: {e}")
+            sig = None
+        if not isinstance(sig, dict):
+            continue
 
-    # 4) Salvar sinais da rodada
-    save_json(SIGNALS_FILE, signals)
-    logging.info("💾 Sinais salvos em %s", SIGNALS_FILE)
+        sig["symbol"]     = sym
+        sig["confidence"] = float(final_conf)
+        sig["rr"]         = float(sig.get("rr", 2.0))
+        sig["strategy"]   = sig.get("strategy", "RSI+MACD+EMA+BB")
+        sig["created_at"] = sig.get("created_at", _ts())
+        if "id" not in sig:
+            sig["id"] = f"sig-{int(time.time())}"
 
-    # 5) Gravar histórico (se habilitado)
-    if SAVE_HISTORY:
+        ok_to_send, reason = should_send_and_register(
+            {"symbol": sym, "entry": sig.get("entry"), "tp": sig.get("tp"), "sl": sig.get("sl")},
+            cooldown_hours=COOLDOWN_HOURS,
+            change_threshold_pct=CHANGE_THRESHOLD_PCT
+        )
+        if not ok_to_send:
+            print(f"🟡 {sym} não enviado ({reason}).")
+            continue
+
+        payload = {
+            "symbol": sym,
+            "entry_price": sig.get("entry"),
+            "target_price": sig.get("tp"),
+            "stop_loss": sig.get("sl"),
+            "risk_reward": sig.get("rr", 2.0),
+            "confidence_score": round(final_conf*100, 2),
+            "strategy": sig.get("strategy"),
+            "created_at": sig.get("created_at"),
+            "id": sig.get("id"),
+        }
+        pushed = False
         try:
-            # append o snapshot desses sinais no histórico
-            hist = append_cycle_to_history(HISTORY_FILE, signals)
-            logging.info("🗂️ Histórico atualizado em %s (entries=%d)", HISTORY_FILE, len(hist))
-
-            # 6) Auto-train (se habilitado + dados suficientes)
-            _try_autotrain(hist)
+            pushed = send_signal_notification(payload)
         except Exception as e:
-            logging.exception("Erro ao gravar histórico/treinar: %s", e)
+            print(f"⚠️ Falha no envio (notifier): {e}")
+        print("✅ Notificado." if pushed else "❌ Falha no envio.")
 
-    # 7) Resolver resultados e notificar (texto + imagem)
-    try:
-        resolve_and_notify()  # já usa SIGNALS_FILE/HISTORY_FILE internamente
-        logging.info("📣 Notificações enviadas (quando aplicável).")
-    except Exception as e:
-        logging.exception("Erro ao notificar: %s", e)
-
-def main_loop():
-    while True:
         try:
-            runner_once()
+            append_signal(sig)
+            saved += 1
         except Exception as e:
-            logging.exception("Falha no ciclo: %s", e)
-        time.sleep(INTERVAL_MIN * 60)
+            print(f"⚠️ Erro ao salvar {SIGNALS_FILE}: {e}")
+
+    print(f"🗂 {saved} sinais salvos em {SIGNALS_FILE}")
+    print(f"🕒 Fim: {_ts()}")
 
 if __name__ == "__main__":
-    main_loop()
+    run_pipeline()
